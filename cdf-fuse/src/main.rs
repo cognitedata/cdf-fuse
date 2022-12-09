@@ -7,6 +7,7 @@ mod err;
 mod fs;
 
 fn main() {
+    env_logger::init();
     let matches = Command::new("CDF FileSystem")
         .arg(
             Arg::new("mount-point")

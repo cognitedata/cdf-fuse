@@ -5,8 +5,9 @@ use std::{
     time::Duration,
 };
 
-use cognite::{AuthenticatorConfig, ClientConfig, CogniteClient};
+use cognite::{AuthenticatorConfig, CogniteClient};
 use fuser::{FileType, Filesystem, FUSE_ROOT_ID};
+use log::{debug, trace};
 use serde::Deserialize;
 use tokio::runtime::{Builder, Runtime};
 
@@ -100,7 +101,7 @@ impl Filesystem for CdfFS {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        println!("Lookup {:?} for parent {}", name.to_str(), parent);
+        debug!("Lookup {:?} for parent {}", name.to_str(), parent);
         let name_str = name.to_str().unwrap();
         let (is_loaded, path) = {
             let parent = match self.cache.get_dir(parent) {
@@ -149,7 +150,7 @@ impl Filesystem for CdfFS {
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
-        println!("Opendir called");
+        debug!("Open directory with ino {}", ino);
         let node = match self.cache.inode_map.get(&ino) {
             Some(x) => match x {
                 Inode::File(_) => fail!(libc::ENOENT, reply),
@@ -173,11 +174,11 @@ impl Filesystem for CdfFS {
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        println!("Readdir called with {} for ino {}", offset, ino);
+        debug!("Readdir called with offset {} for ino {}", offset, ino);
         let node = match self.cache.inode_map.get(&ino) {
             Some(x) => match x {
                 Inode::File(_) => fail!(libc::ENOENT, reply),
@@ -195,15 +196,16 @@ impl Filesystem for CdfFS {
             Err(e) => fail!(e.as_code(), reply),
         };
 
-        println!("Found {} files and {} directories", files.len(), dirs.len());
+        debug!("Found {} files and {} directories", files.len(), dirs.len());
 
         let iter = Self::to_dir_desc(files, dirs);
         let iter = iter.skip(offset as usize);
 
         for entry in iter {
-            println!(
+            trace!(
                 "Add entry {} to buffer with offset {}",
-                entry.name, entry.offset
+                entry.name,
+                entry.offset
             );
             let buffer_full: bool = reply.add(entry.inode, entry.offset, entry.typ, entry.name);
 

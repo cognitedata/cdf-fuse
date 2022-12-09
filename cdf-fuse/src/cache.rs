@@ -9,6 +9,7 @@ use cognite::{
     CogniteClient, FilterWithRequest, PartitionedFilter,
 };
 use fuser::{FileAttr, FileType, FUSE_ROOT_ID};
+use log::{info, trace};
 
 use crate::{err::FsError, fs::CdfFS};
 
@@ -258,6 +259,10 @@ impl Cache {
             None => 5,
         };
 
+        info!(
+            "Loading files from CDF, doing {} parallel queries",
+            num_parallel
+        );
         let res = client
             .files
             .filter_all_partitioned(
@@ -273,7 +278,7 @@ impl Cache {
                 num_parallel as u32,
             )
             .await?;
-        println!("Found {} raw files", res.len());
+        info!("Found a total of {} files in CDF", res.len());
 
         Ok(res
             .into_iter()
@@ -354,7 +359,7 @@ impl Cache {
                             .push(Inode::Directory(current_path.clone()));
 
                         if !self.directories.contains_key(&current_path) {
-                            println!("Building directory {} with parent {}", current_path, parent);
+                            trace!("Inserting directory with path {}", current_path);
                             self.directories.insert(
                                 current_path.clone(),
                                 CachedDirectory {
@@ -377,6 +382,11 @@ impl Cache {
                     }
                 }
             }
+            trace!(
+                "Loaded file with name {} and id {}",
+                file.meta.name,
+                file.meta.id
+            );
             current_parent.children.push(Inode::File(file.meta.id));
             self.inode_map
                 .insert(file.meta.id as u64, Inode::File(file.meta.id));
