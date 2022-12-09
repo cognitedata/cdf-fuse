@@ -11,7 +11,7 @@ use fuser::{FileType, Filesystem, FUSE_ROOT_ID};
 use log::{debug, trace};
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     runtime::{Builder, Runtime},
 };
 
@@ -237,10 +237,29 @@ impl Filesystem for CdfFS {
         run!(
             self,
             reply,
-            self.cache
-                .open_file(&self.client, ino, is_write, is_read, true)
+            self.cache.open_file(&self.client, ino, is_write, is_read)
         );
         reply.opened(self.get_next_fh(), 0);
+    }
+
+    fn write(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        run!(
+            self,
+            reply,
+            Self::write_from_buf(&mut self.cache, &self.client, ino, offset, data)
+        );
+        reply.written(data.len() as u32);
     }
 
     fn release(
@@ -257,8 +276,30 @@ impl Filesystem for CdfFS {
         // This way when you reopen a file it is reloaded, but not before.
         // No real way to do much better than this.
         debug!("Closing file with ino {} and wiping cached data", ino);
-        run!(self, reply, self.cache.close_file(ino));
+        run!(self, reply, self.cache.close_file(&self.client, ino));
         reply.ok()
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        // Not alot we can do here...
+        self.getattr(_req, ino, reply);
     }
 
     fn flush(
@@ -367,7 +408,7 @@ impl CdfFS {
         size: u32,
     ) -> Result<Vec<u8>, FsError> {
         debug!("Open file with ino {} for read", ino);
-        let mut file = cache.open_file(client, ino, false, true, false).await?;
+        let mut file = cache.open_file(client, ino, false, true).await?;
         let file_size = file.metadata().await?.len();
         let read_size = size.min(file_size.saturating_sub(offset as u64) as u32);
         debug!(
@@ -380,6 +421,23 @@ impl CdfFS {
         debug!("Begin read");
         file.read_exact(&mut buffer).await?;
         Ok(buffer)
+    }
+
+    async fn write_from_buf(
+        cache: &mut Cache,
+        client: &CogniteClient,
+        ino: u64,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        debug!("Open file with ino {} for write", ino);
+        let mut file = cache.open_file(client, ino, true, false).await?;
+        file.seek(SeekFrom::Start(offset as u64)).await?;
+        file.write_all(data).await?;
+        cache.update_stored_size(ino, (data.len() + offset as usize) as u64)?;
+        file.flush().await?;
+        debug!("Finished writing from buffer");
+        Ok(())
     }
 
     fn to_dir_desc<'a>(

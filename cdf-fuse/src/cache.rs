@@ -6,17 +6,17 @@ use std::{
 
 use bytes::Bytes;
 use cognite::{
-    files::{FileFilter, FileMetadata},
+    files::{AddFile, FileFilter, FileMetadata},
     CogniteClient, FilterWithRequest, Identity, PartitionedFilter,
 };
 use fuser::{FileAttr, FileType, FUSE_ROOT_ID};
 use futures_util::{SinkExt, TryStreamExt};
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use tokio::{
     fs::{remove_file, File, OpenOptions},
     io::{BufWriter, Sink},
 };
-use tokio_util::codec::{BytesCodec, FramedWrite};
+use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
 use crate::{err::FsError, fs::CdfFS};
 
@@ -36,6 +36,7 @@ pub struct CachedFile {
     pub read_at: Option<Instant>,
     pub inode: u64,
     pub known_size: Option<u64>,
+    pub local_mod: bool,
 }
 
 const BLOCK_SIZE: u64 = 512;
@@ -72,19 +73,25 @@ impl CachedFile {
         &self,
         cache_dir: &str,
         write: bool,
-        append: bool,
         read: bool,
         wipe: bool,
     ) -> Result<File, std::io::Error> {
         let path = self.get_cache_file_path(cache_dir);
-        OpenOptions::new()
-            .write(write)
-            .create_new(wipe)
-            .append(true)
-            .read(read)
-            .create(true)
-            .open(path)
-            .await
+        if !write {
+            if !path.exists() {
+                File::create(path).await
+            } else {
+                File::open(path).await
+            }
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .truncate(wipe)
+                .read(read)
+                .create(true)
+                .open(path)
+                .await
+        }
     }
 }
 
@@ -255,7 +262,6 @@ impl Cache {
         file: u64,
         write: bool,
         read: bool,
-        append: bool,
     ) -> Result<File, FsError> {
         let file = self
             .inode_map
@@ -265,21 +271,26 @@ impl Cache {
             .ok_or_else(|| FsError::FileNotFound)?;
 
         let should_read = !file.is_new
-            && (read || append)
             && match file.read_at {
-                Some(x) => x.elapsed().as_millis() > 600_000,
+                Some(_) => false,
                 None => true,
-            };
+            }
+            && file.meta.uploaded;
         // Always need to open file in write mode...
         let handle = file
-            .get_cache_file(&self.cache_dir, should_read, append, read, should_read)
+            .get_cache_file(&self.cache_dir, should_read || write, read, should_read)
             .await?;
+
+        debug!("File successfully opened!");
 
         if should_read {
             info!(
                 "Downloading file with id {} and name {} from CDF",
                 file.meta.id, file.meta.name
             );
+            if file.local_mod {
+                warn!("Overwriting file with local modifications");
+            }
             let mut stream = client
                 .files
                 .download_file(Identity::Id { id: file.meta.id })
@@ -294,7 +305,7 @@ impl Cache {
             .await?;
             file.read_at = Some(Instant::now());
             let handle = file
-                .get_cache_file(&self.cache_dir, write, append, read, false)
+                .get_cache_file(&self.cache_dir, write, read, false)
                 .await?;
             file.known_size = Some(handle.metadata().await?.len());
             Ok(handle)
@@ -303,18 +314,123 @@ impl Cache {
         }
     }
 
-    pub async fn close_file(&mut self, file: u64) -> Result<(), FsError> {
+    pub fn update_stored_size(&mut self, file: u64, new_size: u64) -> Result<(), FsError> {
         let file = self
             .inode_map
             .get(&file)
             .and_then(|n| n.file())
             .and_then(|f| self.files.get_mut(&f))
             .ok_or_else(|| FsError::FileNotFound)?;
-        let path = file.get_cache_file_path(&self.cache_dir);
+        info!("Updating file in cache, new size: {}", new_size);
+        file.local_mod = true;
+        if new_size > file.known_size.unwrap_or(0) {
+            file.known_size = Some(new_size);
+        }
+        Ok(())
+    }
+
+    async fn upload_changed_file(
+        &mut self,
+        file: u64,
+        client: &CogniteClient,
+    ) -> Result<(Option<CachedFile>, Option<i64>, PathBuf), FsError> {
+        let old = self
+            .inode_map
+            .get(&file)
+            .and_then(|n| n.file())
+            .and_then(|f| self.files.get_mut(&f))
+            .ok_or_else(|| FsError::FileNotFound)?;
+        old.read_at = None;
+        let mut path = old.get_cache_file_path(&self.cache_dir);
+        if !old.local_mod {
+            debug!("Closing file without modifications");
+            return Ok((None, None, path));
+        }
+
+        let size = tokio::fs::metadata(&path).await?.len();
+
+        let new = client.files.upload(true, &AddFile::from(&old.meta)).await?;
+        let mut new = CachedFile {
+            inode: new.id as u64,
+            meta: new,
+            loaded_at: Some(Instant::now()),
+            is_new: false,
+            read_at: Some(Instant::now()),
+            known_size: Some(size),
+            local_mod: false,
+        };
+        let mut ret = None;
+        let mut rem_id = None;
+        let url = new.meta.upload_url.clone();
+        let mime = new
+            .meta
+            .mime_type
+            .clone()
+            .unwrap_or("application/bytes".to_string());
+        let id = new.meta.id;
+        new.meta.uploaded = true;
+        old.meta.uploaded = true;
+        // We need to delete the old one...
+        if new.meta.id != old.meta.id {
+            debug!("File has changed id, removing old file from CDF");
+            rem_id = Some(old.meta.id);
+            // First, remove it from its parent's array
+            let parent = self.directories.get_mut(
+                &old.meta
+                    .directory
+                    .clone()
+                    .map(|d| d.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| "".to_string()),
+            );
+            if let Some(parent) = parent {
+                let idx = parent
+                    .children
+                    .iter()
+                    .position(|i| i.file() == Some(old.meta.id));
+                if let Some(idx) = idx {
+                    parent.children.remove(idx);
+                }
+                parent.children.push(Inode::File(new.meta.id));
+            }
+
+            // Next, remove it from the main files map and the inodes map
+            // TODO: remove file from files list, must be done elsewhere due to borrow...
+            // self.files.remove(&file.meta.id);
+            self.inode_map.remove(&(old.meta.id as u64));
+
+            // Move the buffer file from old to new
+            let new_path = Path::new(&self.cache_dir).join(new.meta.id.to_string());
+            tokio::fs::rename(&path, &new_path).await?;
+            path = new_path;
+            ret = Some(new);
+        }
+        self.inode_map.insert(id as u64, Inode::File(id));
+        // TODO insert the file into the file map...
+        let rfile = File::open(&path).await?;
+        let stream = FramedRead::new(rfile, BytesCodec::new());
+
+        info!("Uploading file to CDF with new size {}", size);
+        client
+            .files
+            .upload_stream_known_size(&mime, &url.unwrap(), stream, size)
+            .await?;
+        Ok((ret, rem_id, path))
+    }
+
+    pub async fn close_file(&mut self, client: &CogniteClient, file: u64) -> Result<(), FsError> {
+        let (new, rem_id, path) = self.upload_changed_file(file, client).await?;
+
+        if let Some(new) = new {
+            self.files.insert(new.meta.id, new);
+        }
+        if let Some(rem_id) = rem_id {
+            self.files.remove(&rem_id);
+        }
+
         if path.exists() {
             remove_file(path).await?;
         }
-        file.read_at = None;
+
         Ok(())
     }
 
@@ -394,6 +510,7 @@ impl Cache {
                 is_new: false,
                 read_at: None,
                 known_size: None,
+                local_mod: false,
             })
             .collect())
     }
