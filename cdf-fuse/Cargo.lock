@@ -74,10 +74,12 @@ checksum = "e9f73505338f7d905b19d18738976aae232eb46b8efc15554ffc56deb5d9ebe4"
 name = "cdf-fuse"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "cognite",
  "env_logger",
  "fuser",
+ "futures-util",
  "libc",
  "log",
  "serde",

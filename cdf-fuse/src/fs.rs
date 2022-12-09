@@ -1,5 +1,6 @@
 use std::{
     ffi::c_int,
+    io::SeekFrom,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -9,9 +10,15 @@ use cognite::{AuthenticatorConfig, CogniteClient};
 use fuser::{FileType, Filesystem, FUSE_ROOT_ID};
 use log::{debug, trace};
 use serde::Deserialize;
-use tokio::runtime::{Builder, Runtime};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    runtime::{Builder, Runtime},
+};
 
-use crate::cache::{Cache, CachedDirectory, CachedFile, Inode};
+use crate::{
+    cache::{Cache, CachedDirectory, CachedFile, Inode},
+    err::FsError,
+};
 
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +49,15 @@ macro_rules! fail {
         $repl.error($code);
         return;
     }};
+}
+
+macro_rules! run {
+    ($slf:ident, $repl:ident, $fut:expr) => {
+        match $slf.rt.block_on($fut) {
+            Ok(x) => x,
+            Err(e) => fail!(e.as_code(), $repl),
+        }
+    };
 }
 
 impl Filesystem for CdfFS {
@@ -188,14 +204,7 @@ impl Filesystem for CdfFS {
         }
         .clone();
 
-        let (files, dirs) = match self
-            .rt
-            .block_on(self.cache.open_directory(&self.client, &node))
-        {
-            Ok(x) => x,
-            Err(e) => fail!(e.as_code(), reply),
-        };
-
+        let (files, dirs) = run!(self, reply, self.cache.open_directory(&self.client, &node));
         debug!("Found {} files and {} directories", files.len(), dirs.len());
 
         let iter = Self::to_dir_desc(files, dirs);
@@ -215,6 +224,71 @@ impl Filesystem for CdfFS {
         }
 
         reply.ok();
+    }
+
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        debug!("open() called for inode {}", ino);
+        let (is_read, is_write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => (true, false),
+            libc::O_RDWR => (true, true),
+            libc::O_WRONLY => (false, true),
+            _ => fail!(libc::EINVAL, reply),
+        };
+        run!(
+            self,
+            reply,
+            self.cache
+                .open_file(&self.client, ino, is_write, is_read, true)
+        );
+        reply.opened(self.get_next_fh(), 0);
+    }
+
+    fn release(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        // Closing the file means releasing the cache
+        // This way when you reopen a file it is reloaded, but not before.
+        // No real way to do much better than this.
+        debug!("Closing file with ino {} and wiping cached data", ino);
+        run!(self, reply, self.cache.close_file(ino));
+        reply.ok()
+    }
+
+    fn flush(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.ok()
+    }
+
+    fn read(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyData,
+    ) {
+        let data = run!(
+            self,
+            reply,
+            Self::read_to_buf(&mut self.cache, &self.client, ino, offset, size)
+        );
+        reply.data(&data);
     }
 }
 
@@ -283,6 +357,29 @@ impl CdfFS {
             temp_dir,
             fh_counter: AtomicU64::new(0),
         }
+    }
+
+    async fn read_to_buf(
+        cache: &mut Cache,
+        client: &CogniteClient,
+        ino: u64,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, FsError> {
+        debug!("Open file with ino {} for read", ino);
+        let mut file = cache.open_file(client, ino, false, true, false).await?;
+        let file_size = file.metadata().await?.len();
+        let read_size = size.min(file_size.saturating_sub(offset as u64) as u32);
+        debug!(
+            "Read data from file with size {}, {} bytes",
+            file_size, read_size
+        );
+
+        let mut buffer = vec![0u8; read_size as usize];
+        file.seek(SeekFrom::Start(offset as u64)).await?;
+        debug!("Begin read");
+        file.read_exact(&mut buffer).await?;
+        Ok(buffer)
     }
 
     fn to_dir_desc<'a>(

@@ -1,15 +1,22 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
 
+use bytes::Bytes;
 use cognite::{
     files::{FileFilter, FileMetadata},
-    CogniteClient, FilterWithRequest, PartitionedFilter,
+    CogniteClient, FilterWithRequest, Identity, PartitionedFilter,
 };
 use fuser::{FileAttr, FileType, FUSE_ROOT_ID};
-use log::{info, trace};
+use futures_util::{SinkExt, TryStreamExt};
+use log::{debug, info, trace};
+use tokio::{
+    fs::{remove_file, File, OpenOptions},
+    io::{BufWriter, Sink},
+};
+use tokio_util::codec::{BytesCodec, FramedWrite};
 
 use crate::{err::FsError, fs::CdfFS};
 
@@ -25,15 +32,21 @@ pub struct CachedDirectory {
 pub struct CachedFile {
     pub meta: FileMetadata,
     pub loaded_at: Option<Instant>,
+    pub is_new: bool,
+    pub read_at: Option<Instant>,
     pub inode: u64,
+    pub known_size: Option<u64>,
 }
+
+const BLOCK_SIZE: u64 = 512;
 
 impl CachedFile {
     pub fn get_file_attr(&self) -> FileAttr {
+        let size = self.known_size.unwrap_or(0);
         FileAttr {
             ino: self.inode,
-            size: 0, // not usually known at this stage
-            blocks: 0,
+            size: size, // not usually known at this stage
+            blocks: (size + BLOCK_SIZE - 1) / BLOCK_SIZE,
             atime: SystemTime::now(),
             mtime: SystemTime::UNIX_EPOCH
                 + Duration::from_millis(self.meta.last_updated_time as u64),
@@ -46,9 +59,32 @@ impl CachedFile {
             uid: 501,
             gid: 20,
             rdev: 0,
-            blksize: 0,
+            blksize: BLOCK_SIZE as u32,
             flags: 512,
         }
+    }
+
+    pub fn get_cache_file_path(&self, cache_dir: &str) -> PathBuf {
+        Path::new(cache_dir).join(self.meta.id.to_string())
+    }
+
+    pub async fn get_cache_file(
+        &self,
+        cache_dir: &str,
+        write: bool,
+        append: bool,
+        read: bool,
+        wipe: bool,
+    ) -> Result<File, std::io::Error> {
+        let path = self.get_cache_file_path(cache_dir);
+        OpenOptions::new()
+            .write(write)
+            .create_new(wipe)
+            .append(true)
+            .read(read)
+            .create(true)
+            .open(path)
+            .await
     }
 }
 
@@ -213,6 +249,75 @@ impl Cache {
         Ok(())
     }
 
+    pub async fn open_file(
+        &mut self,
+        client: &CogniteClient,
+        file: u64,
+        write: bool,
+        read: bool,
+        append: bool,
+    ) -> Result<File, FsError> {
+        let file = self
+            .inode_map
+            .get(&file)
+            .and_then(|n| n.file())
+            .and_then(|f| self.files.get_mut(&f))
+            .ok_or_else(|| FsError::FileNotFound)?;
+
+        let should_read = !file.is_new
+            && (read || append)
+            && match file.read_at {
+                Some(x) => x.elapsed().as_millis() > 600_000,
+                None => true,
+            };
+        // Always need to open file in write mode...
+        let handle = file
+            .get_cache_file(&self.cache_dir, should_read, append, read, should_read)
+            .await?;
+
+        if should_read {
+            info!(
+                "Downloading file with id {} and name {} from CDF",
+                file.meta.id, file.meta.name
+            );
+            let mut stream = client
+                .files
+                .download_file(Identity::Id { id: file.meta.id })
+                .await?
+                .map_err(|e| FsError::from(cognite::Error::from(e)));
+            let fwrite = FramedWrite::new(handle, BytesCodec::new());
+            <FramedWrite<tokio::fs::File, BytesCodec> as SinkExt<Bytes>>::sink_map_err(
+                fwrite,
+                FsError::from,
+            )
+            .send_all(&mut stream)
+            .await?;
+            file.read_at = Some(Instant::now());
+            let handle = file
+                .get_cache_file(&self.cache_dir, write, append, read, false)
+                .await?;
+            file.known_size = Some(handle.metadata().await?.len());
+            Ok(handle)
+        } else {
+            Ok(handle)
+        }
+    }
+
+    pub async fn close_file(&mut self, file: u64) -> Result<(), FsError> {
+        let file = self
+            .inode_map
+            .get(&file)
+            .and_then(|n| n.file())
+            .and_then(|f| self.files.get_mut(&f))
+            .ok_or_else(|| FsError::FileNotFound)?;
+        let path = file.get_cache_file_path(&self.cache_dir);
+        if path.exists() {
+            remove_file(path).await?;
+        }
+        file.read_at = None;
+        Ok(())
+    }
+
     pub async fn open_directory<'a>(
         &'a mut self,
         client: &CogniteClient,
@@ -286,6 +391,9 @@ impl Cache {
                 inode: f.id as u64,
                 meta: f,
                 loaded_at: None,
+                is_new: false,
+                read_at: None,
+                known_size: None,
             })
             .collect())
     }

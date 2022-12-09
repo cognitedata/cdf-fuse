@@ -2,11 +2,19 @@
 pub enum FsError {
     Cognite(cognite::Error),
     DirectoryNotFound,
+    FileNotFound,
+    Io(std::io::Error),
 }
 
 impl From<cognite::Error> for FsError {
     fn from(e: cognite::Error) -> Self {
         Self::Cognite(e)
+    }
+}
+
+impl From<std::io::Error> for FsError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
     }
 }
 
