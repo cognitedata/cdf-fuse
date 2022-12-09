@@ -57,6 +57,10 @@ impl Filesystem for CdfFS {
         }
         std::fs::create_dir_all(&temp_dir_path)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::ENOENT))?;
+
+        // Load the root node into the cache
+        self.cache.init(false);
+
         Ok(())
     }
 
@@ -64,7 +68,7 @@ impl Filesystem for CdfFS {
         let attr = match self.cache.inode_map.get(&ino) {
             Some(x) => match x {
                 Inode::File(f) => self.cache.files.get(f).map(|f| f.get_file_attr()),
-                Inode::Directory(d) => self.cache.data.get(d).map(|d| d.get_file_attr()),
+                Inode::Directory(d) => self.cache.directories.get(d).map(|d| d.get_file_attr()),
             },
             None => {
                 if ino == FUSE_ROOT_ID {
@@ -75,7 +79,7 @@ impl Filesystem for CdfFS {
                         Ok(_) => {}
                         Err(e) => fail!(e.as_code(), reply),
                     }
-                    self.cache.data.get("").map(|d| d.get_file_attr())
+                    self.cache.directories.get("").map(|d| d.get_file_attr())
                 } else {
                     fail!(libc::ENOENT, reply);
                 }
@@ -96,34 +100,43 @@ impl Filesystem for CdfFS {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        println!("Lookup {:?} for parent {}", name.to_str(), parent);
         let name_str = name.to_str().unwrap();
-        let parent = match self.cache.inode_map.get(&parent) {
-            Some(Inode::Directory(d)) => d,
+        let (is_loaded, path) = {
+            let parent = match self.cache.get_dir(parent) {
+                Some(d) => d,
+                _ => fail!(libc::ENOENT, reply),
+            };
+            (
+                parent.loaded_at.is_none(),
+                parent.path.to_owned().unwrap_or_else(|| "".to_string()),
+            )
+        };
+
+        if is_loaded {
+            match self
+                .rt
+                .block_on(self.cache.open_directory(&self.client, &path))
+            {
+                Err(x) => fail!(x.as_code(), reply),
+                _ => (),
+            }
+        }
+
+        let parent = match self.cache.get_dir(parent) {
+            Some(d) => d,
             _ => fail!(libc::ENOENT, reply),
         };
-        let attr = self
-            .cache
-            .parents
-            .get(parent)
-            .and_then(|children| children.iter().find(|c| Self::get_dir_name(c) == name_str))
-            .and_then(|d| self.cache.data.get(d))
-            .map(|d| d.get_file_attr())
-            .or_else(|| {
-                self.cache
-                    .data
-                    .get(parent)
-                    .and_then(|p| {
-                        p.files
-                            .iter()
-                            .filter_map(|f| self.cache.files.get(f))
-                            .find(|f| f.meta.name == name_str)
-                    })
-                    .map(|f| f.get_file_attr())
-            });
+
+        let attr = parent
+            .children
+            .iter()
+            .filter_map(|n| self.cache.get_node(n))
+            .find(|n| n.name() == name_str);
 
         match attr {
             Some(x) => {
-                reply.entry(&Duration::new(0, 0), &x, 0);
+                reply.entry(&Duration::new(0, 0), &x.get_file_attr(), 0);
             }
             None => fail!(libc::ENOENT, reply),
         }
