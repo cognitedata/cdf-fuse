@@ -38,6 +38,7 @@ struct Config {
 pub struct CdfFS {
     rt: Runtime,
     client: CogniteClient,
+    #[allow(dead_code)]
     config: Config,
     temp_dir: String,
     cache: Cache,
@@ -69,10 +70,10 @@ impl Filesystem for CdfFS {
         // Create a temporary directory for us, wiping it first if it already exists.
         let temp_dir_path = Path::new(&self.temp_dir);
         if temp_dir_path.exists() {
-            std::fs::remove_dir_all(&temp_dir_path)
+            std::fs::remove_dir_all(temp_dir_path)
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::ENOENT))?;
         }
-        std::fs::create_dir_all(&temp_dir_path)
+        std::fs::create_dir_all(temp_dir_path)
             .map_err(|e| e.raw_os_error().unwrap_or(libc::ENOENT))?;
 
         // Load the root node into the cache
@@ -126,18 +127,12 @@ impl Filesystem for CdfFS {
             };
             (
                 parent.loaded_at.is_none(),
-                parent.path.to_owned().unwrap_or_else(|| "".to_string()),
+                parent.path.to_owned().unwrap_or_default(),
             )
         };
 
         if is_loaded {
-            match self
-                .rt
-                .block_on(self.cache.open_directory(&self.client, &path))
-            {
-                Err(x) => fail!(x.as_code(), reply),
-                _ => (),
-            }
+            run!(self, reply, self.cache.open_directory(&self.client, &path));
         }
 
         let parent = match self.cache.get_dir(parent) {
@@ -246,12 +241,12 @@ impl Filesystem for CdfFS {
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         data: &[u8],
-        write_flags: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
         run!(
@@ -284,18 +279,18 @@ impl Filesystem for CdfFS {
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
-        size: Option<u64>,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        fh: Option<u64>,
+        _fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        flags: Option<u32>,
+        _flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
         // Not alot we can do here...

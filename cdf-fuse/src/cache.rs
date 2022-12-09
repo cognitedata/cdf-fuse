@@ -12,10 +12,7 @@ use cognite::{
 use fuser::{FileAttr, FileType, FUSE_ROOT_ID};
 use futures_util::{SinkExt, TryStreamExt};
 use log::{debug, info, trace, warn};
-use tokio::{
-    fs::{remove_file, File, OpenOptions},
-    io::{BufWriter, Sink},
-};
+use tokio::fs::{remove_file, File, OpenOptions};
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
 use crate::{err::FsError, fs::CdfFS};
@@ -46,7 +43,7 @@ impl CachedFile {
         let size = self.known_size.unwrap_or(0);
         FileAttr {
             ino: self.inode,
-            size: size, // not usually known at this stage
+            size, // not usually known at this stage
             blocks: (size + BLOCK_SIZE - 1) / BLOCK_SIZE,
             atime: SystemTime::now(),
             mtime: SystemTime::UNIX_EPOCH
@@ -208,6 +205,7 @@ impl Cache {
         node.directory().and_then(|d| self.directories.get(d))
     }
 
+    #[allow(dead_code)]
     pub fn get_file(&self, node: u64) -> Option<&CachedFile> {
         self.inode_map
             .get(&node)
@@ -230,7 +228,7 @@ impl Cache {
         raw_dir: &str,
     ) -> Result<(), FsError> {
         let dir = self.directories.get(raw_dir);
-        let root = if raw_dir != "" {
+        let root = if raw_dir.is_empty() {
             Some(raw_dir.to_string())
         } else {
             None
@@ -249,9 +247,7 @@ impl Cache {
         .await?;
         self.build_directories_from_files(&files, root);
         for file in files {
-            if !self.files.contains_key(&file.meta.id) {
-                self.files.insert(file.meta.id, file);
-            }
+            self.files.entry(file.meta.id).or_insert(file);
         }
         Ok(())
     }
@@ -268,14 +264,9 @@ impl Cache {
             .get(&file)
             .and_then(|n| n.file())
             .and_then(|f| self.files.get_mut(&f))
-            .ok_or_else(|| FsError::FileNotFound)?;
+            .ok_or(FsError::FileNotFound)?;
 
-        let should_read = !file.is_new
-            && match file.read_at {
-                Some(_) => false,
-                None => true,
-            }
-            && file.meta.uploaded;
+        let should_read = !file.is_new && file.read_at.is_none() && file.meta.uploaded;
         // Always need to open file in write mode...
         let handle = file
             .get_cache_file(&self.cache_dir, should_read || write, read, should_read)
@@ -320,7 +311,7 @@ impl Cache {
             .get(&file)
             .and_then(|n| n.file())
             .and_then(|f| self.files.get_mut(&f))
-            .ok_or_else(|| FsError::FileNotFound)?;
+            .ok_or(FsError::FileNotFound)?;
         info!("Updating file in cache, new size: {}", new_size);
         file.local_mod = true;
         if new_size > file.known_size.unwrap_or(0) {
@@ -339,7 +330,7 @@ impl Cache {
             .get(&file)
             .and_then(|n| n.file())
             .and_then(|f| self.files.get_mut(&f))
-            .ok_or_else(|| FsError::FileNotFound)?;
+            .ok_or(FsError::FileNotFound)?;
         old.read_at = None;
         let mut path = old.get_cache_file_path(&self.cache_dir);
         if !old.local_mod {
@@ -366,7 +357,7 @@ impl Cache {
             .meta
             .mime_type
             .clone()
-            .unwrap_or("application/bytes".to_string());
+            .unwrap_or_else(|| "application/bytes".to_string());
         let id = new.meta.id;
         new.meta.uploaded = true;
         old.meta.uploaded = true;
@@ -558,11 +549,11 @@ impl Cache {
             let mut current_path = "".to_string();
             let mut current_parent = self.directories.get_mut("").unwrap();
             if let Some(dir) = &file.meta.directory {
-                let path = Path::new(dir.trim_start_matches("/"));
+                let path = Path::new(dir.trim_start_matches('/'));
 
                 for comp in path.components() {
                     let parent = current_path.clone();
-                    if current_path != "" {
+                    if !current_path.is_empty() {
                         current_path.push('/');
                     }
                     current_path.push_str(comp.as_os_str().to_str().unwrap());
