@@ -282,7 +282,7 @@ impl Filesystem for CdfFS {
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
+        size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
@@ -293,7 +293,25 @@ impl Filesystem for CdfFS {
         _flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        // Not alot we can do here...
+        if let Some(size) = size {
+            debug!("truncate() called with {:?} {:?}", ino, size);
+
+            let fh = run!(
+                self,
+                reply,
+                self.cache.open_file(&self.client, ino, true, false)
+            );
+            let file = self.cache.get_file_mut(ino).unwrap();
+            match self.rt.block_on(fh.set_len(size)) {
+                Ok(_) => (),
+                Err(e) => {
+                    reply.error(FsError::from(e).as_code());
+                    return;
+                }
+            }
+            file.known_size = Some(size);
+        }
+
         self.getattr(_req, ino, reply);
     }
 

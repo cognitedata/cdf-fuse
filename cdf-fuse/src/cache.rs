@@ -212,6 +212,13 @@ impl Cache {
             .and_then(|n| self.get_file_inode(n))
     }
 
+    pub fn get_file_mut(&mut self, node: u64) -> Option<&mut CachedFile> {
+        self.inode_map
+            .get(&node)
+            .and_then(|n| n.file())
+            .and_then(|f| self.files.get_mut(&f))
+    }
+
     pub fn get_file_inode(&self, node: &Inode) -> Option<&CachedFile> {
         node.file().and_then(|f| self.files.get(&f))
     }
@@ -228,7 +235,7 @@ impl Cache {
         raw_dir: &str,
     ) -> Result<(), FsError> {
         let dir = self.directories.get(raw_dir);
-        let root = if raw_dir.is_empty() {
+        let root = if !raw_dir.is_empty() {
             Some(raw_dir.to_string())
         } else {
             None
@@ -361,6 +368,7 @@ impl Cache {
         let id = new.meta.id;
         new.meta.uploaded = true;
         old.meta.uploaded = true;
+        old.local_mod = false;
         // We need to delete the old one...
         if new.meta.id != old.meta.id {
             debug!("File has changed id, removing old file from CDF");
