@@ -154,6 +154,11 @@ impl Filesystem for CdfFS {
         }
     }
 
+    fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
+        debug!("Asked to forget inode {}", ino);
+        self.cache.forget_inode(ino);
+    }
+
     fn opendir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -199,10 +204,11 @@ impl Filesystem for CdfFS {
         }
         .clone();
 
-        let (files, dirs) = run!(self, reply, self.cache.open_directory(&self.client, &node));
+        let (files, dirs, parent) =
+            run!(self, reply, self.cache.open_directory(&self.client, &node));
         debug!("Found {} files and {} directories", files.len(), dirs.len());
 
-        let iter = Self::to_dir_desc(files, dirs);
+        let iter = Self::to_dir_desc(ino, parent, files, dirs);
         let iter = iter.skip(offset as usize);
 
         for entry in iter {
@@ -454,25 +460,43 @@ impl CdfFS {
     }
 
     fn to_dir_desc<'a>(
+        inode: u64,
+        parent: Option<u64>,
         files: Vec<&'a CachedFile>,
         dirs: Vec<&'a CachedDirectory>,
     ) -> impl Iterator<Item = EntryDesc> + 'a {
         let len = files.len();
-        files
+        let f_iter = files
             .into_iter()
             .enumerate()
             .map(|(idx, f)| EntryDesc {
                 inode: f.inode,
-                offset: idx as i64 + 1,
+                offset: idx as i64 + 3,
                 typ: FileType::RegularFile,
                 name: f.meta.name.clone(),
             })
             .chain(dirs.into_iter().enumerate().map(move |(idx, f)| EntryDesc {
                 inode: f.inode,
-                offset: idx as i64 + (len as i64) + 1,
+                offset: idx as i64 + (len as i64) + 3,
                 typ: FileType::Directory,
                 name: f.name.clone(),
-            }))
+            }));
+        let mut fixed = Vec::new();
+        fixed.push(EntryDesc {
+            inode,
+            offset: 1,
+            typ: FileType::Directory,
+            name: ".".to_string(),
+        });
+        if let Some(p) = parent {
+            fixed.push(EntryDesc {
+                inode: p,
+                offset: 2,
+                typ: FileType::Directory,
+                name: "..".to_string(),
+            })
+        }
+        fixed.into_iter().chain(f_iter)
     }
 
     fn get_next_fh(&mut self) -> u64 {

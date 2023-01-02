@@ -229,6 +229,10 @@ impl Cache {
             .or_else(|| self.get_dir_inode(node).map(NodeRef::Dir))
     }
 
+    pub fn get_inode_of_dir(&self, dir: &String) -> Option<u64> {
+        self.directories.get(dir).map(|d| d.inode)
+    }
+
     pub async fn reload_directory(
         &mut self,
         client: &CogniteClient,
@@ -327,6 +331,37 @@ impl Cache {
         Ok(())
     }
 
+    pub fn forget_inode(&mut self, node: u64) {
+        match self.inode_map.get(&node) {
+            Some(Inode::File(f)) => {
+                let file = self.files.remove(f);
+                if let Some(file) = file {
+                    let parent = self.directories.get_mut(
+                        &file
+                            .meta
+                            .directory
+                            .clone()
+                            .map(|d| d.trim_start_matches('/').to_string())
+                            .unwrap_or_else(|| "".to_string()),
+                    );
+                    if let Some(parent) = parent {
+                        let idx = parent
+                            .children
+                            .iter()
+                            .position(|i| i.file() == Some(file.meta.id));
+                        if let Some(idx) = idx {
+                            parent.children.remove(idx);
+                        }
+                    }
+                }
+            }
+            Some(Inode::Directory(d)) => {
+                self.directories.remove(d);
+            }
+            None => (),
+        }
+    }
+
     async fn upload_changed_file(
         &mut self,
         file: u64,
@@ -393,8 +428,6 @@ impl Cache {
             }
 
             // Next, remove it from the main files map and the inodes map
-            // TODO: remove file from files list, must be done elsewhere due to borrow...
-            // self.files.remove(&file.meta.id);
             self.inode_map.remove(&(old.meta.id as u64));
 
             // Move the buffer file from old to new
@@ -404,7 +437,6 @@ impl Cache {
             ret = Some(new);
         }
         self.inode_map.insert(id as u64, Inode::File(id));
-        // TODO insert the file into the file map...
         let rfile = File::open(&path).await?;
         let stream = FramedRead::new(rfile, BytesCodec::new());
 
@@ -437,7 +469,7 @@ impl Cache {
         &'a mut self,
         client: &CogniteClient,
         raw_dir: &str,
-    ) -> Result<(Vec<&'a CachedFile>, Vec<&'a CachedDirectory>), FsError> {
+    ) -> Result<(Vec<&'a CachedFile>, Vec<&'a CachedDirectory>, Option<u64>), FsError> {
         let mut dir = self.directories.get(raw_dir);
         let should_reload = match dir {
             Some(x) => match x.loaded_at {
@@ -466,7 +498,11 @@ impl Cache {
             }
         }
 
-        Ok((final_files, final_dirs))
+        Ok((
+            final_files,
+            final_dirs,
+            dir.parent.as_ref().and_then(|p| self.get_inode_of_dir(p)),
+        ))
     }
 
     async fn load_cached_directory(
