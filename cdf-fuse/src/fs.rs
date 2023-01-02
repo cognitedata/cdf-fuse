@@ -8,7 +8,7 @@ use std::{
 
 use cognite::{AuthenticatorConfig, CogniteClient};
 use fuser::{FileType, Filesystem, FUSE_ROOT_ID};
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -134,7 +134,7 @@ impl Filesystem for CdfFS {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        info!("Lookup {:?} for parent {}", name.to_str(), parent);
+        debug!("Lookup {:?} for parent {}", name.to_str(), parent);
         let name_str = name.to_str().unwrap();
         let (is_loaded, path) = {
             let parent = match self.cache.get_dir(parent) {
@@ -171,8 +171,8 @@ impl Filesystem for CdfFS {
     }
 
     fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
-        // info!("Asked to forget inode {}", ino);
-        // self.cache.forget_inode(ino);
+        info!("Asked to forget inode {}", ino);
+        self.cache.forget_inode(ino);
     }
 
     fn opendir(

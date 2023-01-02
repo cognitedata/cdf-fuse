@@ -11,8 +11,7 @@ use cognite::{
 };
 use fuser::{FileAttr, FileType, FUSE_ROOT_ID};
 use futures_util::{SinkExt, TryStreamExt};
-use log::{debug, info, trace, warn};
-use mime_guess::Mime;
+use log::{debug, info, warn};
 use tokio::fs::{remove_file, File, OpenOptions};
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
@@ -342,29 +341,17 @@ impl Cache {
     pub fn forget_inode(&mut self, node: u64) {
         match self.inode_map.get(&node) {
             Some(Inode::File(f)) => {
-                let file = self.files.remove(f);
+                let file = self.files.get_mut(f);
                 if let Some(file) = file {
-                    let parent = self.directories.get_mut(
-                        &file
-                            .meta
-                            .directory
-                            .clone()
-                            .map(|d| d.trim_start_matches('/').to_string())
-                            .unwrap_or_else(|| "".to_string()),
-                    );
-                    if let Some(parent) = parent {
-                        let idx = parent
-                            .children
-                            .iter()
-                            .position(|i| i.file() == Some(file.meta.id));
-                        if let Some(idx) = idx {
-                            parent.children.remove(idx);
-                        }
-                    }
+                    file.loaded_at = None;
+                    file.known_size = None;
                 }
             }
             Some(Inode::Directory(d)) => {
-                self.directories.remove(d);
+                let dir = self.directories.get_mut(d);
+                if let Some(dir) = dir {
+                    dir.loaded_at = None;
+                }
             }
             None => (),
         }
@@ -657,7 +644,7 @@ impl Cache {
                             .push(Inode::Directory(current_path.clone()));
 
                         if !self.directories.contains_key(&current_path) {
-                            info!("Inserting directory with path {}", current_path);
+                            debug!("Inserting directory with path {}", current_path);
                             let old = old_map.remove(&current_path);
                             let keep_children = old
                                 .map(|c| {
@@ -697,7 +684,7 @@ impl Cache {
                     current_parent = self.directories.get_mut(&current_path).unwrap();
                 }
             }
-            info!(
+            debug!(
                 "Loaded file with name {} and id {} into parent {}, directory: {:?}",
                 file.meta.name, file.meta.id, current_parent.name, file.meta.directory
             );
