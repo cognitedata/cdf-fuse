@@ -82,6 +82,7 @@ dependencies = [
  "futures-util",
  "libc",
  "log",
+ "mime_guess",
  "serde",
  "serde_json",
  "tokio",

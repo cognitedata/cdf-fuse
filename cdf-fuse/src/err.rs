@@ -4,6 +4,8 @@ pub enum FsError {
     DirectoryNotFound,
     FileNotFound,
     Io(std::io::Error),
+    InvalidPath,
+    NotEmpty,
 }
 
 impl From<cognite::Error> for FsError {

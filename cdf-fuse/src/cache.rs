@@ -1,17 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use cognite::{
     files::{AddFile, FileFilter, FileMetadata},
-    CogniteClient, FilterWithRequest, Identity, PartitionedFilter,
+    CogniteClient, Delete, FilterWithRequest, Identity, PartitionedFilter,
 };
 use fuser::{FileAttr, FileType, FUSE_ROOT_ID};
 use futures_util::{SinkExt, TryStreamExt};
 use log::{debug, info, trace, warn};
+use mime_guess::Mime;
 use tokio::fs::{remove_file, File, OpenOptions};
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
@@ -135,6 +136,7 @@ impl<'a> NodeRef<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum Inode {
     File(i64),
     Directory(String),
@@ -199,6 +201,12 @@ impl Cache {
         self.inode_map
             .get(&node)
             .and_then(|n| self.get_dir_inode(n))
+    }
+
+    pub fn get_dir_mut(&mut self, node: u64) -> Option<&mut CachedDirectory> {
+        self.inode_map
+            .get(&node)
+            .and_then(|n| n.directory().and_then(|d| self.directories.get_mut(d)))
     }
 
     pub fn get_dir_inode(&self, node: &Inode) -> Option<&CachedDirectory> {
@@ -406,7 +414,10 @@ impl Cache {
         old.local_mod = false;
         // We need to delete the old one...
         if new.meta.id != old.meta.id {
-            debug!("File has changed id, removing old file from CDF");
+            info!(
+                "File {} has changed id, removing old file from CDF",
+                new.meta.name
+            );
             rem_id = Some(old.meta.id);
             // First, remove it from its parent's array
             let parent = self.directories.get_mut(
@@ -417,6 +428,7 @@ impl Cache {
                     .unwrap_or_else(|| "".to_string()),
             );
             if let Some(parent) = parent {
+                info!("Removing from parent {}...", parent.name);
                 let idx = parent
                     .children
                     .iter()
@@ -424,11 +436,21 @@ impl Cache {
                 if let Some(idx) = idx {
                     parent.children.remove(idx);
                 }
+                info!("Push to parent with id {}", new.meta.id);
                 parent.children.push(Inode::File(new.meta.id));
             }
 
             // Next, remove it from the main files map and the inodes map
             self.inode_map.remove(&(old.meta.id as u64));
+
+            let res = client
+                .files
+                .delete(&[Identity::Id { id: old.meta.id }])
+                .await;
+            match res {
+                Ok(_) => (),
+                Err(e) => warn!("Failed to delete old file from CDF: {:?}", e),
+            }
 
             // Move the buffer file from old to new
             let new_path = Path::new(&self.cache_dir).join(new.meta.id.to_string());
@@ -440,7 +462,7 @@ impl Cache {
         let rfile = File::open(&path).await?;
         let stream = FramedRead::new(rfile, BytesCodec::new());
 
-        info!("Uploading file to CDF with new size {}", size);
+        info!("Uploading file {:?} to CDF with new size {}", path, size);
         client
             .files
             .upload_stream_known_size(&mime, &url.unwrap(), stream, size)
@@ -452,6 +474,7 @@ impl Cache {
         let (new, rem_id, path) = self.upload_changed_file(file, client).await?;
 
         if let Some(new) = new {
+            info!("Create new file in cache {} {}", new.meta.name, new.meta.id);
             self.files.insert(new.meta.id, new);
         }
         if let Some(rem_id) = rem_id {
@@ -492,6 +515,11 @@ impl Cache {
             None => return Err(FsError::DirectoryNotFound),
         };
         for child in &dir.children {
+            info!(
+                "Load child {:?} {}",
+                child,
+                self.get_node(child).unwrap().name()
+            );
             match child {
                 Inode::File(f) => final_files.push(self.files.get(f).unwrap()),
                 Inode::Directory(d) => final_dirs.push(self.directories.get(d).unwrap()),
@@ -562,6 +590,8 @@ impl Cache {
     fn build_directories_from_files(&mut self, files: &[CachedFile], root: Option<String>) {
         // We refresh the directory tree based on the returned data
         // Anything at or below "parent" overwrites the existing data, and needs to be removed here.
+        let mut old_map = HashMap::new();
+        info!("Refresh all directories for root {:?}", root);
         match &root {
             Some(x) => {
                 let mut to_remove = vec![];
@@ -574,10 +604,14 @@ impl Cache {
                     let old = self.directories.remove(&dir);
                     if let Some(old) = old {
                         self.inode_map.remove(&old.inode);
+                        old_map.insert(old.path.clone().unwrap_or_else(|| "".to_string()), old);
                     }
                 }
             }
             None => {
+                for (k, dir) in self.directories.drain() {
+                    old_map.insert(k, dir);
+                }
                 self.directories.clear();
                 self.inode_map.clear();
             }
@@ -588,6 +622,10 @@ impl Cache {
         // The root directory needs to exist
         self.init(root.is_none());
 
+        let now_unix_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let mut visited = HashSet::new();
         for file in files {
             let mut current_path = "".to_string();
@@ -619,13 +657,30 @@ impl Cache {
                             .push(Inode::Directory(current_path.clone()));
 
                         if !self.directories.contains_key(&current_path) {
-                            trace!("Inserting directory with path {}", current_path);
+                            info!("Inserting directory with path {}", current_path);
+                            let old = old_map.remove(&current_path);
+                            let keep_children = old
+                                .map(|c| {
+                                    c.children
+                                        .into_iter()
+                                        .filter(|c| {
+                                            self.get_file_inode(c)
+                                                .map(|f| {
+                                                    f.is_new
+                                                        || now_unix_ts as i64 - f.meta.created_time
+                                                            < 60_000
+                                                })
+                                                .unwrap_or_default()
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_else(|| vec![]);
                             self.directories.insert(
                                 current_path.clone(),
                                 CachedDirectory {
                                     path: Some(current_path.clone()),
                                     parent: Some(parent),
-                                    children: vec![],
+                                    children: keep_children,
                                     loaded_at,
                                     inode: inode + 1,
                                     name: CdfFS::get_dir_name(&current_path).to_string(),
@@ -638,18 +693,192 @@ impl Cache {
                             let dir = self.directories.get_mut(&current_path).unwrap();
                             dir.loaded_at = loaded_at;
                         }
-                        current_parent = self.directories.get_mut(&current_path).unwrap();
                     }
+                    current_parent = self.directories.get_mut(&current_path).unwrap();
                 }
             }
-            trace!(
-                "Loaded file with name {} and id {}",
-                file.meta.name,
-                file.meta.id
+            info!(
+                "Loaded file with name {} and id {} into parent {}, directory: {:?}",
+                file.meta.name, file.meta.id, current_parent.name, file.meta.directory
             );
             current_parent.children.push(Inode::File(file.meta.id));
             self.inode_map
                 .insert(file.meta.id as u64, Inode::File(file.meta.id));
         }
+    }
+
+    pub fn create_dir(&mut self, name: String, parent: u64) -> Result<Inode, FsError> {
+        let parent_path = &self
+            .get_dir(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?
+            .path;
+
+        let inode = self.get_max_inode() + 1;
+
+        let parent_path_c = parent_path.clone();
+        let path = if let Some(p) = parent_path {
+            Path::new(&p).join(&name)
+        } else {
+            Path::new(&name).to_path_buf()
+        };
+        let path_str = path.to_str().unwrap().to_string();
+
+        let dir = CachedDirectory {
+            path: Some(path_str.clone()),
+            parent: parent_path_c,
+            children: vec![],
+            loaded_at: Some(Instant::now()),
+            inode,
+            name,
+        };
+
+        let ind = Inode::Directory(path_str.clone());
+
+        {
+            let parent = self.get_dir_mut(parent).unwrap();
+            parent.children.push(ind.clone());
+        }
+
+        self.directories.insert(path_str.clone(), dir);
+        self.inode_map.insert(inode, ind.clone());
+
+        Ok(ind)
+    }
+
+    pub async fn create_file(
+        &mut self,
+        client: &CogniteClient,
+        name: String,
+        parent: u64,
+    ) -> Result<Inode, FsError> {
+        info!("Create file with name {} and parent {}", name, parent);
+        let parent_path = &self
+            .get_dir(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?
+            .path;
+
+        let mime_type = mime_guess::from_path(&name)
+            .first()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "application/binary".to_string());
+
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        info!(
+            "File created with directory {}",
+            parent_path
+                .clone()
+                .map(|p| format!("/{}", p))
+                .unwrap_or("".to_string())
+        );
+
+        let meta = AddFile {
+            name,
+            directory: parent_path.clone().map(|p| format!("/{}", p)),
+            mime_type: Some(mime_type),
+            source_created_time: Some(time),
+            source_modified_time: Some(time),
+            ..Default::default()
+        };
+
+        let created = client.files.upload(false, &meta).await?;
+        let inode = created.id;
+        let file = CachedFile {
+            inode: inode as u64,
+            meta: created,
+            loaded_at: Some(Instant::now()),
+            is_new: true,
+            read_at: None,
+            known_size: Some(0),
+            local_mod: false,
+        };
+
+        let ind = Inode::File(inode);
+
+        {
+            let parent = self.get_dir_mut(parent).unwrap();
+            parent.children.push(ind.clone());
+        }
+
+        self.files.insert(inode, file);
+        self.inode_map.insert(inode as u64, ind.clone());
+
+        Ok(ind)
+    }
+
+    pub async fn delete_node_from_parent(
+        &mut self,
+        client: &CogniteClient,
+        name: &String,
+        parent: u64,
+    ) -> Result<(), FsError> {
+        info!("Delete node {} from parent {}", name, parent);
+        let to_remove = {
+            let parent = self
+                .get_dir(parent)
+                .ok_or_else(|| FsError::DirectoryNotFound)?;
+            let mut to_remove = None;
+            for (idx, child) in parent.children.iter().enumerate() {
+                match child {
+                    Inode::Directory(d) => {
+                        let dir = self.directories.get(d).unwrap();
+                        if &dir.name == name {
+                            to_remove = Some((idx, child.clone()));
+                            break;
+                        }
+                    }
+                    Inode::File(f) => {
+                        let file = self.files.get(f).unwrap();
+                        if &file.meta.name == name {
+                            to_remove = Some((idx, child.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+            to_remove
+        };
+
+        let (idx, to_remove) = to_remove.ok_or_else(|| FsError::FileNotFound)?;
+        info!("Deleting node with index {}, node {:?}", idx, to_remove);
+        let ind = match to_remove {
+            Inode::File(f) => {
+                let file = self.files.remove(&f).unwrap();
+                let e = client
+                    .files
+                    .delete(&[Identity::Id { id: file.meta.id }])
+                    .await;
+                match e {
+                    Ok(()) => (),
+                    Err(e) => {
+                        self.files.insert(f, file);
+                        return Err(FsError::Cognite(e));
+                    }
+                }
+                file.inode
+            }
+            Inode::Directory(d) => {
+                let dir = self.directories.remove(&d).unwrap();
+                if !dir.children.is_empty() {
+                    self.directories.insert(d, dir);
+                    return Err(FsError::NotEmpty);
+                }
+                dir.inode
+            }
+        };
+
+        {
+            let parent = self
+                .get_dir_mut(parent)
+                .ok_or_else(|| FsError::DirectoryNotFound)?;
+            parent.children.remove(idx);
+        }
+
+        self.inode_map.remove(&ind);
+
+        Ok(())
     }
 }

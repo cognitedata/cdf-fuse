@@ -8,7 +8,7 @@ use std::{
 
 use cognite::{AuthenticatorConfig, CogniteClient};
 use fuser::{FileType, Filesystem, FUSE_ROOT_ID};
-use log::{debug, trace};
+use log::{debug, info, trace, warn};
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -52,11 +52,27 @@ macro_rules! fail {
     }};
 }
 
+macro_rules! fail_ret {
+    ($code:expr, $repl:ident) => {{
+        $repl.error($code);
+        return None;
+    }};
+}
+
 macro_rules! run {
     ($slf:ident, $repl:ident, $fut:expr) => {
         match $slf.rt.block_on($fut) {
             Ok(x) => x,
             Err(e) => fail!(e.as_code(), $repl),
+        }
+    };
+}
+
+macro_rules! run_ret {
+    ($slf:ident, $repl:ident, $fut:expr) => {
+        match $slf.rt.block_on($fut) {
+            Ok(x) => x,
+            Err(e) => fail_ret!(e.as_code(), $repl),
         }
     };
 }
@@ -118,7 +134,7 @@ impl Filesystem for CdfFS {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        debug!("Lookup {:?} for parent {}", name.to_str(), parent);
+        info!("Lookup {:?} for parent {}", name.to_str(), parent);
         let name_str = name.to_str().unwrap();
         let (is_loaded, path) = {
             let parent = match self.cache.get_dir(parent) {
@@ -155,8 +171,8 @@ impl Filesystem for CdfFS {
     }
 
     fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
-        debug!("Asked to forget inode {}", ino);
-        self.cache.forget_inode(ino);
+        // info!("Asked to forget inode {}", ino);
+        // self.cache.forget_inode(ino);
     }
 
     fn opendir(
@@ -212,10 +228,9 @@ impl Filesystem for CdfFS {
         let iter = iter.skip(offset as usize);
 
         for entry in iter {
-            trace!(
+            debug!(
                 "Add entry {} to buffer with offset {}",
-                entry.name,
-                entry.offset
+                entry.name, entry.offset
             );
             let buffer_full: bool = reply.add(entry.inode, entry.offset, entry.typ, entry.name);
 
@@ -350,6 +365,103 @@ impl Filesystem for CdfFS {
         );
         reply.data(&data);
     }
+
+    fn mknod(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        let file_type = mode & libc::S_IFMT as u32;
+
+        if file_type != libc::S_IFREG as u32 && file_type != libc::S_IFDIR as u32 {
+            // TODO
+            warn!(
+                "Only regular files and directories may be created. Got {:o}",
+                mode
+            );
+            reply.error(libc::ENOSYS);
+            return;
+        }
+
+        let name = name.to_str().unwrap().to_string();
+
+        // Check for conflicts
+        let reply = match self.file_exists_in_dir(parent, &name, reply) {
+            Some(x) => x,
+            None => return,
+        };
+
+        let inode = if file_type == libc::S_IFREG {
+            run!(
+                self,
+                reply,
+                self.cache.create_file(&self.client, name, parent)
+            )
+        } else {
+            match self.cache.create_dir(name, parent) {
+                Ok(i) => i,
+                Err(e) => {
+                    reply.error(e.as_code());
+                    return;
+                }
+            }
+        };
+
+        let node = self.cache.get_node(&inode).unwrap();
+        reply.entry(&Duration::new(0, 0), &node.get_file_attr(), 0);
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        let name = name.to_str().unwrap().to_string();
+
+        // Check for conflicts
+        let reply = match self.file_exists_in_dir(parent, &name, reply) {
+            Some(x) => x,
+            None => return,
+        };
+
+        let inode = match self.cache.create_dir(name, parent) {
+            Ok(i) => i,
+            Err(e) => {
+                reply.error(e.as_code());
+                return;
+            }
+        };
+        let node = self.cache.get_node(&inode).unwrap();
+        reply.entry(&Duration::new(0, 0), &node.get_file_attr(), 0);
+    }
+
+    fn unlink(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let name = name.to_str().unwrap().to_string();
+
+        run!(
+            self,
+            reply,
+            self.cache
+                .delete_node_from_parent(&self.client, &name, parent)
+        );
+
+        reply.ok();
+    }
 }
 
 struct EntryDesc {
@@ -360,6 +472,33 @@ struct EntryDesc {
 }
 
 impl CdfFS {
+    pub fn file_exists_in_dir(
+        &mut self,
+        parent: u64,
+        name: &String,
+        reply: fuser::ReplyEntry,
+    ) -> Option<fuser::ReplyEntry> {
+        let node = match self.cache.inode_map.get(&parent) {
+            Some(x) => match x {
+                Inode::File(_) => fail_ret!(libc::ENOENT, reply),
+                Inode::Directory(d) => d,
+            },
+            None => fail_ret!(libc::ENOENT, reply),
+        }
+        .clone();
+
+        let (files, dirs, gp) =
+            run_ret!(self, reply, self.cache.open_directory(&self.client, &node));
+
+        let iter = Self::to_dir_desc(parent, gp, files, dirs);
+        for desc in iter {
+            if &desc.name == name {
+                fail_ret!(libc::EEXIST, reply)
+            }
+        }
+        return Some(reply);
+    }
+
     pub fn new(config_path: &str) -> Self {
         let config = std::fs::read(config_path).expect("Failed to read config file");
         let config: Config =
