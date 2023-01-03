@@ -133,6 +133,13 @@ impl<'a> NodeRef<'a> {
             Self::File(f) => &f.meta.name,
         }
     }
+
+    pub fn ino(&self) -> u64 {
+        match self {
+            Self::Dir(d) => d.inode,
+            Self::File(f) => f.inode,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -371,7 +378,7 @@ impl Cache {
         old.read_at = None;
         let mut path = old.get_cache_file_path(&self.cache_dir);
         if !old.local_mod {
-            debug!("Closing file without modifications");
+            debug!("File not modified, will not be flushed");
             return Ok((None, None, path));
         }
 
@@ -428,7 +435,8 @@ impl Cache {
             }
 
             // Next, remove it from the main files map and the inodes map
-            self.inode_map.remove(&(old.meta.id as u64));
+            // Next, add a translation from the old ino to a new ino, we do this so that existing references will keep working...
+            self.inode_map.insert(old.meta.id as u64, Inode::File(id));
 
             let res = client
                 .files
@@ -457,7 +465,11 @@ impl Cache {
         Ok((ret, rem_id, path))
     }
 
-    pub async fn close_file(&mut self, client: &CogniteClient, file: u64) -> Result<(), FsError> {
+    pub async fn flush_file(
+        &mut self,
+        client: &CogniteClient,
+        file: u64,
+    ) -> Result<PathBuf, FsError> {
         let (new, rem_id, path) = self.upload_changed_file(file, client).await?;
 
         if let Some(new) = new {
@@ -468,6 +480,11 @@ impl Cache {
             self.files.remove(&rem_id);
         }
 
+        Ok(path)
+    }
+
+    pub async fn close_file(&mut self, client: &CogniteClient, file: u64) -> Result<(), FsError> {
+        let path = self.flush_file(client, file).await?;
         if path.exists() {
             remove_file(path).await?;
         }
@@ -502,14 +519,20 @@ impl Cache {
             None => return Err(FsError::DirectoryNotFound),
         };
         for child in &dir.children {
-            info!(
+            debug!(
                 "Load child {:?} {}",
                 child,
                 self.get_node(child).unwrap().name()
             );
             match child {
-                Inode::File(f) => final_files.push(self.files.get(f).unwrap()),
-                Inode::Directory(d) => final_dirs.push(self.directories.get(d).unwrap()),
+                Inode::File(f) => {
+                    final_files.push(self.files.get(f).ok_or_else(|| FsError::FileNotFound)?)
+                }
+                Inode::Directory(d) => final_dirs.push(
+                    self.directories
+                        .get(d)
+                        .ok_or_else(|| FsError::DirectoryNotFound)?,
+                ),
             }
         }
 

@@ -1,28 +1,25 @@
-#[derive(Debug)]
+use log::error;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum FsError {
-    Cognite(cognite::Error),
+    #[error("Cognite Error")]
+    Cognite(#[from] cognite::Error),
+    #[error("Directory not found")]
     DirectoryNotFound,
+    #[error("File not found")]
     FileNotFound,
-    Io(std::io::Error),
+    #[error("IOerror from cache files")]
+    Io(#[from] std::io::Error),
+    #[error("Invalid path")]
     InvalidPath,
+    #[error("Directory not empty")]
     NotEmpty,
-}
-
-impl From<cognite::Error> for FsError {
-    fn from(e: cognite::Error) -> Self {
-        Self::Cognite(e)
-    }
-}
-
-impl From<std::io::Error> for FsError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
 }
 
 impl FsError {
     pub fn as_code(&self) -> i32 {
-        println!("Failure! {:?}", self);
+        error!("Failure! {}", self);
         // Just enoent for now, we can figure out better errors in the future...
         libc::EFAULT
     }

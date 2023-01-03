@@ -339,11 +339,13 @@ impl Filesystem for CdfFS {
     fn flush(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
+        info!("Flushing file with ino {}", ino);
+        run!(self, reply, self.cache.flush_file(&self.client, ino));
         reply.ok()
     }
 
@@ -461,6 +463,64 @@ impl Filesystem for CdfFS {
         );
 
         reply.ok();
+    }
+
+    fn rmdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let name = name.to_str().unwrap().to_string();
+
+        run!(
+            self,
+            reply,
+            self.cache
+                .delete_node_from_parent(&self.client, &name, parent)
+        );
+
+        reply.ok();
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        info!("Fsync called for node {}", ino);
+        run!(self, reply, self.cache.flush_file(&self.client, ino));
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        info!("Fsyncdir called for node {}", ino);
+        let dir = match self.cache.get_dir(ino) {
+            Some(x) => x,
+            None => fail!(libc::ENOENT, reply),
+        };
+        let mut inos = vec![];
+        for child in dir.children.iter() {
+            let node = self.cache.get_node(child);
+            if let Some(node) = node {
+                inos.push(node.ino());
+            }
+        }
+
+        for ino in inos {
+            run!(self, reply, self.cache.flush_file(&self.client, ino));
+        }
     }
 }
 
