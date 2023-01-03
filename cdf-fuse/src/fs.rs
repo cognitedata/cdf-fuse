@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    cache::{Cache, CachedDirectory, CachedFile, Inode},
+    cache::{Cache, CachedDirectory, CachedFile},
     err::FsError,
 };
 
@@ -99,11 +99,9 @@ impl Filesystem for CdfFS {
     }
 
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
-        let attr = match self.cache.inode_map.get(&ino) {
-            Some(x) => match x {
-                Inode::File(f) => self.cache.files.get(f).map(|f| f.get_file_attr()),
-                Inode::Directory(d) => self.cache.directories.get(d).map(|d| d.get_file_attr()),
-            },
+        let data = self.cache.get_node(ino).map(|n| n.get_file_attr());
+        let attrs = match data {
+            Some(x) => x,
             None => {
                 if ino == FUSE_ROOT_ID {
                     match self
@@ -113,18 +111,16 @@ impl Filesystem for CdfFS {
                         Ok(_) => {}
                         Err(e) => fail!(e.as_code(), reply),
                     }
-                    self.cache.directories.get("").map(|d| d.get_file_attr())
+                    match self.cache.directories.get("").map(|d| d.get_file_attr()) {
+                        Some(x) => x,
+                        None => fail!(libc::ENOENT, reply),
+                    }
                 } else {
                     fail!(libc::ENOENT, reply);
                 }
             }
         };
-
-        if let Some(a) = attr {
-            reply.attr(&Duration::new(0, 0), &a)
-        } else {
-            fail!(libc::ENOENT, reply);
-        }
+        reply.attr(&Duration::new(0, 0), &attrs);
     }
 
     fn lookup(
@@ -159,7 +155,7 @@ impl Filesystem for CdfFS {
         let attr = parent
             .children
             .iter()
-            .filter_map(|n| self.cache.get_node(n))
+            .filter_map(|n| self.cache.get_node_inode(n))
             .find(|n| n.name() == name_str);
 
         match attr {
@@ -183,11 +179,8 @@ impl Filesystem for CdfFS {
         reply: fuser::ReplyOpen,
     ) {
         debug!("Open directory with ino {}", ino);
-        let node = match self.cache.inode_map.get(&ino) {
-            Some(x) => match x {
-                Inode::File(_) => fail!(libc::ENOENT, reply),
-                Inode::Directory(d) => d,
-            },
+        let node = match self.cache.inode_map.get(&ino).and_then(|i| i.directory()) {
+            Some(x) => x,
             None => fail!(libc::ENOENT, reply),
         }
         .clone();
@@ -211,11 +204,8 @@ impl Filesystem for CdfFS {
         mut reply: fuser::ReplyDirectory,
     ) {
         debug!("Readdir called with offset {} for ino {}", offset, ino);
-        let node = match self.cache.inode_map.get(&ino) {
-            Some(x) => match x {
-                Inode::File(_) => fail!(libc::ENOENT, reply),
-                Inode::Directory(d) => d,
-            },
+        let node = match self.cache.inode_map.get(&ino).and_then(|i| i.directory()) {
+            Some(x) => x,
             None => fail!(libc::ENOENT, reply),
         }
         .clone();
@@ -414,7 +404,7 @@ impl Filesystem for CdfFS {
             }
         };
 
-        let node = self.cache.get_node(&inode).unwrap();
+        let node = self.cache.get_node_inode(&inode).unwrap();
         reply.entry(&Duration::new(0, 0), &node.get_file_attr(), 0);
     }
 
@@ -442,7 +432,7 @@ impl Filesystem for CdfFS {
                 return;
             }
         };
-        let node = self.cache.get_node(&inode).unwrap();
+        let node = self.cache.get_node_inode(&inode).unwrap();
         reply.entry(&Duration::new(0, 0), &node.get_file_attr(), 0);
     }
 
@@ -512,7 +502,7 @@ impl Filesystem for CdfFS {
         };
         let mut inos = vec![];
         for child in dir.children.iter() {
-            let node = self.cache.get_node(child);
+            let node = self.cache.get_node_inode(child);
             if let Some(node) = node {
                 inos.push(node.ino());
             }
@@ -538,11 +528,13 @@ impl CdfFS {
         name: &String,
         reply: fuser::ReplyEntry,
     ) -> Option<fuser::ReplyEntry> {
-        let node = match self.cache.inode_map.get(&parent) {
-            Some(x) => match x {
-                Inode::File(_) => fail_ret!(libc::ENOENT, reply),
-                Inode::Directory(d) => d,
-            },
+        let node = match self
+            .cache
+            .inode_map
+            .get(&parent)
+            .and_then(|p| p.directory())
+        {
+            Some(x) => x,
             None => fail_ret!(libc::ENOENT, reply),
         }
         .clone();

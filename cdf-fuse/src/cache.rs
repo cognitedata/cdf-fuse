@@ -144,25 +144,33 @@ impl<'a> NodeRef<'a> {
 
 #[derive(Debug, Clone)]
 pub enum Inode {
-    File(i64),
-    Directory(String),
+    File { ino: u64, id: i64 },
+    Directory { ino: u64, dir: String },
 }
 
 impl Inode {
     pub fn is_file(&self) -> bool {
-        matches!(self, Self::File(_))
+        matches!(self, Self::File { .. })
+    }
+
+    pub fn new_directory(ino: u64, node: String) -> Self {
+        Self::Directory { ino, dir: node }
+    }
+
+    pub fn new_file(ino: u64, node: i64) -> Self {
+        Self::File { ino, id: node }
     }
 
     pub fn directory(&self) -> Option<&String> {
         match self {
-            Self::Directory(x) => Some(x),
+            Self::Directory { dir: x, .. } => Some(x),
             _ => None,
         }
     }
 
     pub fn file(&self) -> Option<i64> {
         match self {
-            Self::File(x) => Some(*x),
+            Self::File { id: x, .. } => Some(*x),
             _ => None,
         }
     }
@@ -198,8 +206,10 @@ impl Cache {
                     name: "".to_string(),
                 },
             );
-            self.inode_map
-                .insert(FUSE_ROOT_ID, Inode::Directory("".to_string()));
+            self.inode_map.insert(
+                FUSE_ROOT_ID,
+                Inode::new_directory(FUSE_ROOT_ID, "".to_string()),
+            );
         }
     }
 
@@ -237,7 +247,13 @@ impl Cache {
         node.file().and_then(|f| self.files.get(&f))
     }
 
-    pub fn get_node<'a>(&'a self, node: &Inode) -> Option<NodeRef<'a>> {
+    pub fn get_node<'a>(&'a self, node: u64) -> Option<NodeRef<'a>> {
+        self.inode_map
+            .get(&node)
+            .and_then(|k| self.get_node_inode(k))
+    }
+
+    pub fn get_node_inode<'a>(&'a self, node: &Inode) -> Option<NodeRef<'a>> {
         self.get_file_inode(node)
             .map(NodeRef::File)
             .or_else(|| self.get_dir_inode(node).map(NodeRef::Dir))
@@ -347,14 +363,14 @@ impl Cache {
 
     pub fn forget_inode(&mut self, node: u64) {
         match self.inode_map.get(&node) {
-            Some(Inode::File(f)) => {
+            Some(Inode::File { id: f, .. }) => {
                 let file = self.files.get_mut(f);
                 if let Some(file) = file {
                     file.loaded_at = None;
                     file.known_size = None;
                 }
             }
-            Some(Inode::Directory(d)) => {
+            Some(Inode::Directory { dir: d, .. }) => {
                 let dir = self.directories.get_mut(d);
                 if let Some(dir) = dir {
                     dir.loaded_at = None;
@@ -431,12 +447,15 @@ impl Cache {
                     parent.children.remove(idx);
                 }
                 info!("Push to parent with id {}", new.meta.id);
-                parent.children.push(Inode::File(new.meta.id));
+                parent
+                    .children
+                    .push(Inode::new_file(new.meta.id as u64, new.meta.id));
             }
 
             // Next, remove it from the main files map and the inodes map
             // Next, add a translation from the old ino to a new ino, we do this so that existing references will keep working...
-            self.inode_map.insert(old.meta.id as u64, Inode::File(id));
+            self.inode_map
+                .insert(old.meta.id as u64, Inode::new_file(old.meta.id as u64, id));
 
             let res = client
                 .files
@@ -453,7 +472,8 @@ impl Cache {
             path = new_path;
             ret = Some(new);
         }
-        self.inode_map.insert(id as u64, Inode::File(id));
+        self.inode_map
+            .insert(id as u64, Inode::new_file(id as u64, id));
         let rfile = File::open(&path).await?;
         let stream = FramedRead::new(rfile, BytesCodec::new());
 
@@ -522,13 +542,13 @@ impl Cache {
             debug!(
                 "Load child {:?} {}",
                 child,
-                self.get_node(child).unwrap().name()
+                self.get_node_inode(child).unwrap().name()
             );
             match child {
-                Inode::File(f) => {
+                Inode::File { id: f, .. } => {
                     final_files.push(self.files.get(f).ok_or_else(|| FsError::FileNotFound)?)
                 }
-                Inode::Directory(d) => final_dirs.push(
+                Inode::Directory { dir: d, .. } => final_dirs.push(
                     self.directories
                         .get(d)
                         .ok_or_else(|| FsError::DirectoryNotFound)?,
@@ -639,7 +659,7 @@ impl Cache {
         let mut visited = HashSet::new();
         for file in files {
             let mut current_path = "".to_string();
-            let mut current_parent = self.directories.get_mut("").unwrap();
+
             if let Some(dir) = &file.meta.directory {
                 let path = Path::new(dir.trim_start_matches('/'));
 
@@ -661,10 +681,6 @@ impl Cache {
                         } else {
                             Some(Instant::now())
                         };
-
-                        current_parent
-                            .children
-                            .push(Inode::Directory(current_path.clone()));
 
                         if !self.directories.contains_key(&current_path) {
                             debug!("Inserting directory with path {}", current_path);
@@ -689,7 +705,7 @@ impl Cache {
                                 current_path.clone(),
                                 CachedDirectory {
                                     path: Some(current_path.clone()),
-                                    parent: Some(parent),
+                                    parent: Some(parent.clone()),
                                     children: keep_children,
                                     loaded_at,
                                     inode: inode + 1,
@@ -698,22 +714,35 @@ impl Cache {
                             );
                             inode += 1;
                             self.inode_map
-                                .insert(inode, Inode::Directory(current_path.clone()));
+                                .insert(inode, Inode::new_directory(inode, current_path.clone()));
+                            let current_parent = self.directories.get_mut(&parent).unwrap();
+                            current_parent
+                                .children
+                                .push(Inode::new_directory(inode, current_path.clone()));
                         } else {
                             let dir = self.directories.get_mut(&current_path).unwrap();
                             dir.loaded_at = loaded_at;
+                            let inode = dir.inode;
+                            let current_parent = self.directories.get_mut(&parent).unwrap();
+                            current_parent
+                                .children
+                                .push(Inode::new_directory(inode, current_path.clone()));
                         }
                     }
-                    current_parent = self.directories.get_mut(&current_path).unwrap();
                 }
             }
             debug!(
                 "Loaded file with name {} and id {} into parent {}, directory: {:?}",
-                file.meta.name, file.meta.id, current_parent.name, file.meta.directory
+                file.meta.name, file.meta.id, current_path, file.meta.directory
             );
-            current_parent.children.push(Inode::File(file.meta.id));
-            self.inode_map
-                .insert(file.meta.id as u64, Inode::File(file.meta.id));
+            let current_parent = self.directories.get_mut(&current_path).unwrap();
+            current_parent
+                .children
+                .push(Inode::new_file(file.meta.id as u64, file.meta.id));
+            self.inode_map.insert(
+                file.meta.id as u64,
+                Inode::new_file(file.meta.id as u64, file.meta.id),
+            );
         }
     }
 
@@ -731,7 +760,10 @@ impl Cache {
         } else {
             Path::new(&name).to_path_buf()
         };
-        let path_str = path.to_str().unwrap().to_string();
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| FsError::InvalidPath)?
+            .to_string();
 
         let dir = CachedDirectory {
             path: Some(path_str.clone()),
@@ -742,7 +774,7 @@ impl Cache {
             name,
         };
 
-        let ind = Inode::Directory(path_str.clone());
+        let ind = Inode::new_directory(inode, path_str.clone());
 
         {
             let parent = self.get_dir_mut(parent).unwrap();
@@ -806,7 +838,7 @@ impl Cache {
             local_mod: false,
         };
 
-        let ind = Inode::File(inode);
+        let ind = Inode::new_file(inode as u64, inode);
 
         {
             let parent = self.get_dir_mut(parent).unwrap();
@@ -833,14 +865,14 @@ impl Cache {
             let mut to_remove = None;
             for (idx, child) in parent.children.iter().enumerate() {
                 match child {
-                    Inode::Directory(d) => {
+                    Inode::Directory { dir: d, .. } => {
                         let dir = self.directories.get(d).unwrap();
                         if &dir.name == name {
                             to_remove = Some((idx, child.clone()));
                             break;
                         }
                     }
-                    Inode::File(f) => {
+                    Inode::File { id: f, .. } => {
                         let file = self.files.get(f).unwrap();
                         if &file.meta.name == name {
                             to_remove = Some((idx, child.clone()));
@@ -855,7 +887,7 @@ impl Cache {
         let (idx, to_remove) = to_remove.ok_or_else(|| FsError::FileNotFound)?;
         info!("Deleting node with index {}, node {:?}", idx, to_remove);
         let ind = match to_remove {
-            Inode::File(f) => {
+            Inode::File { id: f, .. } => {
                 let file = self.files.remove(&f).unwrap();
                 let e = client
                     .files
@@ -870,7 +902,7 @@ impl Cache {
                 }
                 file.inode
             }
-            Inode::Directory(d) => {
+            Inode::Directory { dir: d, .. } => {
                 let dir = self.directories.remove(&d).unwrap();
                 if !dir.children.is_empty() {
                     self.directories.insert(d, dir);
