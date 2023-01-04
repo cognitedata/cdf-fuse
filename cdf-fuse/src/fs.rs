@@ -16,8 +16,9 @@ use tokio::{
 };
 
 use crate::{
-    cache::{Cache, CachedDirectory, CachedFile},
+    cache::Cache,
     err::FsError,
+    types::{CachedDirectory, CachedFile},
 };
 
 #[derive(Deserialize, Clone)]
@@ -138,12 +139,12 @@ impl Filesystem for CdfFS {
                 _ => fail!(libc::ENOENT, reply),
             };
             (
-                parent.loaded_at.is_none(),
+                !parent.loaded_at.is_none(),
                 parent.path.to_owned().unwrap_or_default(),
             )
         };
 
-        if is_loaded {
+        if !is_loaded {
             run!(self, reply, self.cache.open_directory(&self.client, &path));
         }
 
@@ -502,10 +503,7 @@ impl Filesystem for CdfFS {
         };
         let mut inos = vec![];
         for child in dir.children.iter() {
-            let node = self.cache.get_node_inode(child);
-            if let Some(node) = node {
-                inos.push(node.ino());
-            }
+            inos.push(child.ino());
         }
 
         for ino in inos {
