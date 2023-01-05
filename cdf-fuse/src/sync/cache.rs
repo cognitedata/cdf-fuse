@@ -2,17 +2,18 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 use cognite::{files::FileMetadata, CogniteClient};
-use fuser::FUSE_ROOT_ID;
+use fuser::{FileAttr, FUSE_ROOT_ID};
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
-use crate::err::FsError;
+use crate::{err::FsError, types::CachedDirectory};
 
 use super::{
     cdf_helper::{get_subpaths, load_cached_directory},
-    types::{CacheFileAccess, Node, SyncDirectory, SyncFile},
+    types::{CacheFileAccess, Node, NodeInfo, SyncDirectory, SyncFile},
 };
 
 pub struct SyncCache {
@@ -24,6 +25,34 @@ pub struct SyncCache {
 }
 
 impl SyncCache {
+    pub fn new(cache_dir: String) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            file_map: HashMap::new(),
+            dir_map: HashMap::new(),
+            cache_dir,
+            inode_counter: FUSE_ROOT_ID,
+        }
+    }
+
+    pub fn init(&mut self) {
+        if !self.dir_map.contains_key("/") {
+            self.nodes.insert(
+                FUSE_ROOT_ID,
+                Node::Dir(SyncDirectory {
+                    path: "/".to_string(),
+                    parent: None,
+                    children: vec![],
+                    loaded_at: None,
+                    inode: FUSE_ROOT_ID,
+                    name: "".to_string(),
+                    is_new: false,
+                }),
+            );
+            self.dir_map.insert("/".to_string(), FUSE_ROOT_ID);
+        }
+    }
+
     pub fn get_node(&self, node: u64) -> Option<&Node> {
         self.nodes.get(&node)
     }
@@ -48,11 +77,11 @@ impl SyncCache {
         self.get_node_mut(node).and_then(|n| n.file_mut())
     }
 
-    pub fn get_nodes<'a>(&'a self, nodes: &'a [u64]) -> impl Iterator + 'a {
+    pub fn get_nodes<'a>(&'a self, nodes: &'a [u64]) -> impl Iterator<Item = &Node> + 'a {
         nodes.iter().filter_map(|f| self.get_node(*f))
     }
 
-    pub fn add_file(&mut self, file: FileMetadata) -> u64 {
+    pub fn add_file(&mut self, file: FileMetadata, parent: u64) -> u64 {
         let inode = match self.file_map.get(&file.id) {
             Some(x) => *x,
             None => {
@@ -80,6 +109,7 @@ impl SyncCache {
                 meta: file,
                 inode,
                 is_new: false,
+                parent,
             }),
         );
 
@@ -135,10 +165,6 @@ impl SyncCache {
         for file in files {
             // We need some data from the file before we give up ownership...
             let dir = file.directory.clone();
-
-            // First, register the file in the file map, to obtain an inode.
-            let inode = self.add_file(file);
-
             let ps = get_subpaths(dir);
             // Iterate over path to build directories
             // let mut last_dir = "/".to_string();
@@ -152,6 +178,7 @@ impl SyncCache {
                 built_dirs.get_mut(&last_dir).unwrap().insert(dir);
                 last_dir = dir;
             }
+            let inode = self.add_file(file, last_dir);
             let parent = built_dirs.get_mut(&last_dir).unwrap();
             parent.insert(inode);
         }
@@ -190,6 +217,7 @@ impl SyncCache {
 
             let cdir = self.get_directory_mut(dir).unwrap();
             cdir.children = new_children;
+            cdir.loaded_at = Some(Instant::now());
         }
 
         for node in dead_nodes {
@@ -205,20 +233,33 @@ pub struct State {
 }
 
 impl State {
-    pub async fn open_directory(&self, node: u64) -> Result<Vec<u64>, FsError> {
-        {
+    pub fn new(client: CogniteClient, cache_dir: String) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(SyncCache::new(cache_dir))),
+            client: Arc::new(client),
+        }
+    }
+
+    pub async fn init(&self) {
+        self.cache.write().await.init();
+    }
+
+    pub async fn open_directory(&self, node: u64) -> Result<(Vec<u64>, NodeInfo), FsError> {
+        let info = {
             let cache = self.cache.read().await;
             let dir = cache
                 .get_directory(node)
                 .ok_or_else(|| FsError::DirectoryNotFound)?;
 
             if !dir.should_reload() {
-                return Self::get_directory_children(node, &cache);
+                return Self::get_directory_children(node, &cache)
+                    .map(|r| (r, dir.get_node_info()));
             }
-        }
+            dir.get_node_info()
+        };
 
         let lock = Self::reload_directory(&self, node).await?;
-        Self::get_directory_children(node, &lock)
+        Self::get_directory_children(node, &lock).map(|r| (r, info))
     }
 
     fn get_directory_children(node: u64, cache: &SyncCache) -> Result<Vec<u64>, FsError> {
@@ -226,6 +267,28 @@ impl State {
             .get_directory(node)
             .ok_or_else(|| FsError::DirectoryNotFound)?;
         Ok(dir.children.clone())
+    }
+
+    pub async fn get_node_infos(&self, nodes: &[u64]) -> Vec<NodeInfo> {
+        let cache = self.cache.read().await;
+        cache.get_nodes(nodes).map(|n| n.get_node_info()).collect()
+    }
+
+    pub async fn get_node_info(&self, node: u64) -> Result<NodeInfo, FsError> {
+        let cache = self.cache.read().await;
+        Ok(cache
+            .get_node(node)
+            .ok_or_else(|| FsError::FileNotFound)?
+            .get_node_info())
+    }
+
+    pub async fn get_file_attrs(&self, nodes: &[u64]) -> Vec<FileAttr> {
+        let mut res = vec![];
+        let cache = self.cache.read().await;
+        for node in cache.get_nodes(nodes) {
+            res.push(node.get_file_attr().await);
+        }
+        res
     }
 
     async fn reload_directory(&self, node: u64) -> Result<RwLockWriteGuard<SyncCache>, FsError> {
@@ -249,5 +312,17 @@ impl State {
         cache.update_directories_from_files(files, root);
 
         Ok(cache)
+    }
+
+    pub async fn get_file_attr(&self, node: u64) -> Result<FileAttr, FsError> {
+        let node = self
+            .cache
+            .read()
+            .await
+            .get_node(node)
+            .ok_or_else(|| FsError::FileNotFound)?
+            .get_file_attr()
+            .await;
+        Ok(node)
     }
 }

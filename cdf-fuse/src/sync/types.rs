@@ -70,6 +70,15 @@ impl SyncDirectory {
     pub fn is_below_path(&self, path: &str) -> bool {
         self.path.starts_with(path)
     }
+
+    pub fn get_node_info(&self) -> NodeInfo {
+        NodeInfo {
+            name: self.name.clone(),
+            ino: self.inode,
+            typ: NodeType::File,
+            parent: self.parent,
+        }
+    }
 }
 
 pub struct SyncFile {
@@ -77,11 +86,12 @@ pub struct SyncFile {
     pub meta: FileMetadata,
     pub inode: u64,
     pub is_new: bool,
+    pub parent: u64,
 }
 
 impl SyncFile {
-    pub fn get_file_attr(&self) -> FileAttr {
-        let data = self.cache_file.blocking_read();
+    pub async fn get_file_attr(&self) -> FileAttr {
+        let data = self.cache_file.read().await;
         self.get_file_attr_int(&data)
     }
 
@@ -117,6 +127,27 @@ impl SyncFile {
             .unwrap_or("/");
         sp.starts_with(path)
     }
+
+    pub fn get_node_info(&self) -> NodeInfo {
+        NodeInfo {
+            name: self.meta.name.clone(),
+            ino: self.inode,
+            typ: NodeType::File,
+            parent: Some(self.parent),
+        }
+    }
+}
+
+pub enum NodeType {
+    Dir,
+    File,
+}
+
+pub struct NodeInfo {
+    pub name: String,
+    pub ino: u64,
+    pub typ: NodeType,
+    pub parent: Option<u64>,
 }
 
 pub enum Node {
@@ -125,10 +156,10 @@ pub enum Node {
 }
 
 impl Node {
-    pub fn get_file_attr(&self) -> FileAttr {
+    pub async fn get_file_attr(&self) -> FileAttr {
         match self {
             Self::Dir(d) => d.get_file_attr(),
-            Self::File(d) => d.get_file_attr(),
+            Self::File(d) => d.get_file_attr().await,
         }
     }
 
@@ -136,6 +167,18 @@ impl Node {
         match self {
             Self::Dir(d) => &d.name,
             Self::File(f) => &f.meta.name,
+        }
+    }
+
+    pub fn get_node_info(&self) -> NodeInfo {
+        match self {
+            Self::Dir(d) => NodeInfo {
+                name: d.name.clone(),
+                ino: d.inode,
+                typ: NodeType::Dir,
+                parent: d.parent,
+            },
+            Self::File(f) => f.get_node_info(),
         }
     }
 

@@ -18,6 +18,10 @@ use tokio::{
 use crate::{
     cache::Cache,
     err::FsError,
+    sync::{
+        cache::State,
+        types::{NodeInfo, NodeType},
+    },
     types::{CachedDirectory, CachedFile},
 };
 
@@ -38,11 +42,10 @@ struct Config {
 
 pub struct CdfFS {
     rt: Runtime,
-    client: CogniteClient,
+    state: State,
     #[allow(dead_code)]
     config: Config,
     temp_dir: String,
-    cache: Cache,
     fh_counter: AtomicU64,
 }
 
@@ -94,34 +97,14 @@ impl Filesystem for CdfFS {
             .map_err(|e| e.raw_os_error().unwrap_or(libc::ENOENT))?;
 
         // Load the root node into the cache
-        self.cache.init(false);
+        self.rt.block_on(self.state.init());
 
         Ok(())
     }
 
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
-        let data = self.cache.get_node(ino).map(|n| n.get_file_attr());
-        let attrs = match data {
-            Some(x) => x,
-            None => {
-                if ino == FUSE_ROOT_ID {
-                    match self
-                        .rt
-                        .block_on(self.cache.open_directory(&self.client, ""))
-                    {
-                        Ok(_) => {}
-                        Err(e) => fail!(e.as_code(), reply),
-                    }
-                    match self.cache.directories.get("").map(|d| d.get_file_attr()) {
-                        Some(x) => x,
-                        None => fail!(libc::ENOENT, reply),
-                    }
-                } else {
-                    fail!(libc::ENOENT, reply);
-                }
-            }
-        };
-        reply.attr(&Duration::new(0, 0), &attrs);
+        let attr = run!(self, reply, self.state.get_file_attr(ino));
+        reply.attr(&Duration::new(0, 0), &attr);
     }
 
     fn lookup(
@@ -131,40 +114,18 @@ impl Filesystem for CdfFS {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        debug!("Lookup {:?} for parent {}", name.to_str(), parent);
-        let name_str = name.to_str().unwrap();
-        let (is_loaded, path) = {
-            let parent = match self.cache.get_dir(parent) {
-                Some(d) => d,
-                _ => fail!(libc::ENOENT, reply),
-            };
-            (
-                !parent.loaded_at.is_none(),
-                parent.path.to_owned().unwrap_or_default(),
-            )
-        };
+        let (children, _) = run!(self, reply, self.state.open_directory(parent));
+        let attrs = self.rt.block_on(self.state.get_node_infos(&children));
 
-        if !is_loaded {
-            run!(self, reply, self.cache.open_directory(&self.client, &path));
-        }
+        let name = name.to_str().unwrap();
 
-        let parent = match self.cache.get_dir(parent) {
-            Some(d) => d,
-            _ => fail!(libc::ENOENT, reply),
-        };
-
-        let attr = parent
-            .children
-            .iter()
-            .filter_map(|n| self.cache.get_node_inode(n))
-            .find(|n| n.name() == name_str);
-
-        match attr {
-            Some(x) => {
-                reply.entry(&Duration::new(0, 0), &x.get_file_attr(), 0);
-            }
+        let child = match attrs.iter().find(|a| a.name == name) {
+            Some(x) => x,
             None => fail!(libc::ENOENT, reply),
-        }
+        };
+
+        let attr = run!(self, reply, self.state.get_file_attr(child.ino));
+        reply.entry(&Duration::new(0, 0), &attr, 0);
     }
 
     /* fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
@@ -179,20 +140,7 @@ impl Filesystem for CdfFS {
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
-        debug!("Open directory with ino {}", ino);
-        let node = match self.cache.inode_map.get(&ino).and_then(|i| i.directory()) {
-            Some(x) => x,
-            None => fail!(libc::ENOENT, reply),
-        }
-        .clone();
-
-        match self
-            .rt
-            .block_on(self.cache.open_directory(&self.client, &node))
-        {
-            Ok(_) => {}
-            Err(e) => fail!(e.as_code(), reply),
-        }
+        run!(self, reply, self.state.open_directory(ino));
         reply.opened(self.get_next_fh(), 0);
     }
 
@@ -205,17 +153,10 @@ impl Filesystem for CdfFS {
         mut reply: fuser::ReplyDirectory,
     ) {
         debug!("Readdir called with offset {} for ino {}", offset, ino);
-        let node = match self.cache.inode_map.get(&ino).and_then(|i| i.directory()) {
-            Some(x) => x,
-            None => fail!(libc::ENOENT, reply),
-        }
-        .clone();
+        let (children, self_info) = run!(self, reply, self.state.open_directory(ino));
+        let nodes = self.rt.block_on(self.state.get_node_infos(&children));
 
-        let (files, dirs, parent) =
-            run!(self, reply, self.cache.open_directory(&self.client, &node));
-        debug!("Found {} files and {} directories", files.len(), dirs.len());
-
-        let iter = Self::to_dir_desc(ino, parent, files, dirs);
+        let iter = Self::to_dir_desc(ino, self_info.parent, nodes);
         let iter = iter.skip(offset as usize);
 
         for entry in iter {
@@ -520,7 +461,7 @@ struct EntryDesc {
 }
 
 impl CdfFS {
-    pub fn file_exists_in_dir(
+    /* pub fn file_exists_in_dir(
         &mut self,
         parent: u64,
         name: &String,
@@ -547,7 +488,7 @@ impl CdfFS {
             }
         }
         return Some(reply);
-    }
+    } */
 
     pub fn new(config_path: &str) -> Self {
         let config = std::fs::read(config_path).expect("Failed to read config file");
@@ -600,9 +541,8 @@ impl CdfFS {
             .to_string();
         CdfFS {
             rt,
-            client,
+            state: State::new(client, temp_dir.clone()),
             config,
-            cache: Cache::new(temp_dir.clone()),
             temp_dir,
             fh_counter: AtomicU64::new(0),
         }
@@ -651,25 +591,17 @@ impl CdfFS {
     fn to_dir_desc<'a>(
         inode: u64,
         parent: Option<u64>,
-        files: Vec<&'a CachedFile>,
-        dirs: Vec<&'a CachedDirectory>,
+        entries: Vec<NodeInfo>,
     ) -> impl Iterator<Item = EntryDesc> + 'a {
-        let len = files.len();
-        let f_iter = files
-            .into_iter()
-            .enumerate()
-            .map(|(idx, f)| EntryDesc {
-                inode: f.inode,
-                offset: idx as i64 + 3,
-                typ: FileType::RegularFile,
-                name: f.meta.name.clone(),
-            })
-            .chain(dirs.into_iter().enumerate().map(move |(idx, f)| EntryDesc {
-                inode: f.inode,
-                offset: idx as i64 + (len as i64) + 3,
-                typ: FileType::Directory,
-                name: f.name.clone(),
-            }));
+        let f_iter = entries.into_iter().enumerate().map(|(idx, f)| EntryDesc {
+            inode: f.ino,
+            offset: idx as i64 + 3,
+            typ: match f.typ {
+                NodeType::Dir => FileType::Directory,
+                NodeType::File => FileType::RegularFile,
+            },
+            name: f.name,
+        });
         let mut fixed = Vec::new();
         fixed.push(EntryDesc {
             inode,
