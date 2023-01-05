@@ -26,7 +26,7 @@ pub struct CachedFile {
     pub local_mod: bool,
 }
 
-const BLOCK_SIZE: u64 = 512;
+pub const BLOCK_SIZE: u64 = 512;
 
 impl CachedFile {
     pub fn get_file_attr(&self) -> FileAttr {

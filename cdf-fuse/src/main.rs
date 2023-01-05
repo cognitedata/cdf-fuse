@@ -5,6 +5,7 @@ use fuser::MountOption;
 mod cache;
 mod err;
 mod fs;
+mod sync;
 mod types;
 
 fn main() {

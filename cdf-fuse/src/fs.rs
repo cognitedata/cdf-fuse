@@ -167,10 +167,10 @@ impl Filesystem for CdfFS {
         }
     }
 
-    fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
+    /* fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
         info!("Asked to forget inode {}", ino);
         self.cache.forget_inode(ino);
-    }
+    } */
 
     fn opendir(
         &mut self,
@@ -233,7 +233,7 @@ impl Filesystem for CdfFS {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+    /* fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         debug!("open() called for inode {}", ino);
         let (is_read, is_write) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => (true, false),
@@ -509,7 +509,7 @@ impl Filesystem for CdfFS {
         for ino in inos {
             run!(self, reply, self.cache.flush_file(&self.client, ino));
         }
-    }
+    } */
 }
 
 struct EntryDesc {
