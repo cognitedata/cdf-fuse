@@ -5,15 +5,13 @@ use std::{
     time::Instant,
 };
 
-use cognite::{files::FileMetadata, CogniteClient};
-use fuser::{FileAttr, FUSE_ROOT_ID};
-use tokio::sync::{RwLock, RwLockWriteGuard};
-
-use crate::{err::FsError, types::CachedDirectory};
+use cognite::files::FileMetadata;
+use fuser::FUSE_ROOT_ID;
+use tokio::sync::RwLock;
 
 use super::{
-    cdf_helper::{get_subpaths, load_cached_directory},
-    types::{CacheFileAccess, Node, NodeInfo, SyncDirectory, SyncFile},
+    cdf_helper::get_subpaths,
+    types::{CacheFileAccess, Node, SyncDirectory, SyncFile},
 };
 
 pub struct SyncCache {
@@ -51,6 +49,10 @@ impl SyncCache {
             );
             self.dir_map.insert("/".to_string(), FUSE_ROOT_ID);
         }
+    }
+
+    pub fn add_file_map(&mut self, id: i64, inode: u64) {
+        self.file_map.insert(id, inode);
     }
 
     pub fn get_node(&self, node: u64) -> Option<&Node> {
@@ -127,7 +129,7 @@ impl SyncCache {
 
         if let Some(n) = self.nodes.get_mut(&inode) {
             match n {
-                Node::Dir(d) => {
+                Node::Dir(_) => {
                     return inode;
                 }
                 _ => (),
@@ -224,105 +226,5 @@ impl SyncCache {
             // TODO: Figure out more cleanup here, not sure how likely this really is
             self.nodes.remove(&node);
         }
-    }
-}
-
-pub struct State {
-    pub cache: Arc<RwLock<SyncCache>>,
-    pub client: Arc<CogniteClient>,
-}
-
-impl State {
-    pub fn new(client: CogniteClient, cache_dir: String) -> Self {
-        Self {
-            cache: Arc::new(RwLock::new(SyncCache::new(cache_dir))),
-            client: Arc::new(client),
-        }
-    }
-
-    pub async fn init(&self) {
-        self.cache.write().await.init();
-    }
-
-    pub async fn open_directory(&self, node: u64) -> Result<(Vec<u64>, NodeInfo), FsError> {
-        let info = {
-            let cache = self.cache.read().await;
-            let dir = cache
-                .get_directory(node)
-                .ok_or_else(|| FsError::DirectoryNotFound)?;
-
-            if !dir.should_reload() {
-                return Self::get_directory_children(node, &cache)
-                    .map(|r| (r, dir.get_node_info()));
-            }
-            dir.get_node_info()
-        };
-
-        let lock = Self::reload_directory(&self, node).await?;
-        Self::get_directory_children(node, &lock).map(|r| (r, info))
-    }
-
-    fn get_directory_children(node: u64, cache: &SyncCache) -> Result<Vec<u64>, FsError> {
-        let dir = cache
-            .get_directory(node)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
-        Ok(dir.children.clone())
-    }
-
-    pub async fn get_node_infos(&self, nodes: &[u64]) -> Vec<NodeInfo> {
-        let cache = self.cache.read().await;
-        cache.get_nodes(nodes).map(|n| n.get_node_info()).collect()
-    }
-
-    pub async fn get_node_info(&self, node: u64) -> Result<NodeInfo, FsError> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .get_node(node)
-            .ok_or_else(|| FsError::FileNotFound)?
-            .get_node_info())
-    }
-
-    pub async fn get_file_attrs(&self, nodes: &[u64]) -> Vec<FileAttr> {
-        let mut res = vec![];
-        let cache = self.cache.read().await;
-        for node in cache.get_nodes(nodes) {
-            res.push(node.get_file_attr().await);
-        }
-        res
-    }
-
-    async fn reload_directory(&self, node: u64) -> Result<RwLockWriteGuard<SyncCache>, FsError> {
-        let mut cache = self.cache.write().await;
-        let dir = cache
-            .get_directory(node)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
-        if !dir.should_reload() {
-            return Ok(cache);
-        }
-
-        let expected_size = if dir.loaded_at.is_some() {
-            dir.children.len()
-        } else {
-            100_000
-        };
-
-        let root = dir.path.clone();
-        let files = load_cached_directory(&self.client, expected_size, root.clone()).await?;
-
-        cache.update_directories_from_files(files, root);
-
-        Ok(cache)
-    }
-
-    pub async fn get_file_attr(&self, node: u64) -> Result<FileAttr, FsError> {
-        let node = self
-            .cache
-            .read()
-            .await
-            .get_node(node)
-            .ok_or_else(|| FsError::FileNotFound)?
-            .get_file_attr()
-            .await;
-        Ok(node)
     }
 }

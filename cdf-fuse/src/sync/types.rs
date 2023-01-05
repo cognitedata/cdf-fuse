@@ -7,15 +7,21 @@ use std::{
 
 use cognite::files::FileMetadata;
 use fuser::{FileAttr, FileType};
-use tokio::sync::RwLock;
+use tokio::{
+    fs::{File, OpenOptions},
+    sync::RwLock,
+};
 
-use crate::types::{CachedDirectory, BLOCK_SIZE};
+use crate::{
+    err::FsError,
+    types::{CachedDirectory, BLOCK_SIZE},
+};
 
 pub struct CacheFileAccess {
-    cache_path: PathBuf,
-    local_mod: bool,
-    known_size: Option<u64>,
-    loaded_at: Option<Instant>,
+    pub cache_path: PathBuf,
+    pub local_mod: bool,
+    pub known_size: Option<u64>,
+    pub loaded_at: Option<Instant>,
 }
 
 impl CacheFileAccess {
@@ -26,6 +32,39 @@ impl CacheFileAccess {
             known_size: None,
             loaded_at: None,
         }
+    }
+
+    pub fn exists(&self) -> bool {
+        Path::exists(&self.cache_path)
+    }
+
+    pub async fn get_handle_write(
+        &mut self,
+        wipe: bool,
+        read: bool,
+    ) -> Result<File, std::io::Error> {
+        OpenOptions::new()
+            .write(true)
+            .truncate(wipe)
+            .read(read)
+            .create(true)
+            .open(&self.cache_path)
+            .await
+    }
+
+    pub async fn get_handle_read(&self) -> Result<File, std::io::Error> {
+        File::open(&self.cache_path).await
+    }
+
+    pub async fn size(&self) -> Result<u64, std::io::Error> {
+        Ok(tokio::fs::metadata(&self.cache_path).await?.len())
+    }
+
+    pub async fn set_size(&mut self, size: u64) -> Result<(), std::io::Error> {
+        self.known_size = Some(size);
+        let fh = self.get_handle_write(false, false).await?;
+        fh.set_len(size).await?;
+        Ok(())
     }
 }
 

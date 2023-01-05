@@ -19,10 +19,9 @@ use crate::{
     cache::Cache,
     err::FsError,
     sync::{
-        cache::State,
+        state::State,
         types::{NodeInfo, NodeType},
     },
-    types::{CachedDirectory, CachedFile},
 };
 
 #[derive(Deserialize, Clone)]
@@ -128,10 +127,10 @@ impl Filesystem for CdfFS {
         reply.entry(&Duration::new(0, 0), &attr, 0);
     }
 
-    /* fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
-        info!("Asked to forget inode {}", ino);
-        self.cache.forget_inode(ino);
-    } */
+    fn forget(&mut self, _req: &fuser::Request<'_>, ino: u64, _nlookup: u64) {
+        info!("Asked to forget inode {} nlp {}", ino, _nlookup);
+        // self.cache.forget_inode(ino);
+    }
 
     fn opendir(
         &mut self,
@@ -174,19 +173,9 @@ impl Filesystem for CdfFS {
         reply.ok();
     }
 
-    /* fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         debug!("open() called for inode {}", ino);
-        let (is_read, is_write) = match flags & libc::O_ACCMODE {
-            libc::O_RDONLY => (true, false),
-            libc::O_RDWR => (true, true),
-            libc::O_WRONLY => (false, true),
-            _ => fail!(libc::EINVAL, reply),
-        };
-        run!(
-            self,
-            reply,
-            self.cache.open_file(&self.client, ino, is_write, is_read)
-        );
+        run!(self, reply, self.state.open_file(ino));
         reply.opened(self.get_next_fh(), 0);
     }
 
@@ -202,11 +191,7 @@ impl Filesystem for CdfFS {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        run!(
-            self,
-            reply,
-            Self::write_from_buf(&mut self.cache, &self.client, ino, offset, data)
-        );
+        run!(self, reply, self.state.write_from_buf(ino, offset, data));
         reply.written(data.len() as u32);
     }
 
@@ -220,11 +205,8 @@ impl Filesystem for CdfFS {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        // Closing the file means releasing the cache
-        // This way when you reopen a file it is reloaded, but not before.
-        // No real way to do much better than this.
-        debug!("Closing file with ino {} and wiping cached data", ino);
-        run!(self, reply, self.cache.close_file(&self.client, ino));
+        info!("Closing file with ino {}", ino);
+        run!(self, reply, self.state.close(ino));
         reply.ok()
     }
 
@@ -249,25 +231,12 @@ impl Filesystem for CdfFS {
         if let Some(size) = size {
             debug!("truncate() called with {:?} {:?}", ino, size);
 
-            let fh = run!(
-                self,
-                reply,
-                self.cache.open_file(&self.client, ino, true, false)
-            );
-            let file = self.cache.get_file_mut(ino).unwrap();
-            match self.rt.block_on(fh.set_len(size)) {
-                Ok(_) => (),
-                Err(e) => {
-                    reply.error(FsError::from(e).as_code());
-                    return;
-                }
-            }
-            file.known_size = Some(size);
+            run!(self, reply, self.state.set_size(ino, size));
         }
 
         self.getattr(_req, ino, reply);
     }
-
+    /*
     fn flush(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -279,7 +248,7 @@ impl Filesystem for CdfFS {
         info!("Flushing file with ino {}", ino);
         run!(self, reply, self.cache.flush_file(&self.client, ino));
         reply.ok()
-    }
+    } */
 
     fn read(
         &mut self,
@@ -292,14 +261,11 @@ impl Filesystem for CdfFS {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        let data = run!(
-            self,
-            reply,
-            Self::read_to_buf(&mut self.cache, &self.client, ino, offset, size)
-        );
+        let data = run!(self, reply, self.state.read_to_buf(ino, offset, size));
         reply.data(&data);
     }
 
+    /*
     fn mknod(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -546,46 +512,6 @@ impl CdfFS {
             temp_dir,
             fh_counter: AtomicU64::new(0),
         }
-    }
-
-    async fn read_to_buf(
-        cache: &mut Cache,
-        client: &CogniteClient,
-        ino: u64,
-        offset: i64,
-        size: u32,
-    ) -> Result<Vec<u8>, FsError> {
-        debug!("Open file with ino {} for read", ino);
-        let mut file = cache.open_file(client, ino, false, true).await?;
-        let file_size = file.metadata().await?.len();
-        let read_size = size.min(file_size.saturating_sub(offset as u64) as u32);
-        debug!(
-            "Read data from file with size {}, {} bytes",
-            file_size, read_size
-        );
-
-        let mut buffer = vec![0u8; read_size as usize];
-        file.seek(SeekFrom::Start(offset as u64)).await?;
-        debug!("Begin read");
-        file.read_exact(&mut buffer).await?;
-        Ok(buffer)
-    }
-
-    async fn write_from_buf(
-        cache: &mut Cache,
-        client: &CogniteClient,
-        ino: u64,
-        offset: i64,
-        data: &[u8],
-    ) -> Result<(), FsError> {
-        debug!("Open file with ino {} for write", ino);
-        let mut file = cache.open_file(client, ino, true, false).await?;
-        file.seek(SeekFrom::Start(offset as u64)).await?;
-        file.write_all(data).await?;
-        cache.update_stored_size(ino, (data.len() + offset as usize) as u64)?;
-        file.flush().await?;
-        debug!("Finished writing from buffer");
-        Ok(())
     }
 
     fn to_dir_desc<'a>(
