@@ -49,7 +49,7 @@ impl State {
             let cache = self.cache.read().await;
             let dir = cache
                 .get_directory(node)
-                .ok_or_else(|| FsError::DirectoryNotFound)?;
+                .ok_or(FsError::DirectoryNotFound)?;
 
             if !dir.should_reload() {
                 return Self::get_directory_children(node, &cache)
@@ -58,14 +58,14 @@ impl State {
             dir.get_node_info()
         };
 
-        let lock = Self::reload_directory(&self, node).await?;
+        let lock = self.reload_directory(node).await?;
         Self::get_directory_children(node, &lock).map(|r| (r, info))
     }
 
     fn get_directory_children(node: u64, cache: &SyncCache) -> Result<Vec<u64>, FsError> {
         let dir = cache
             .get_directory(node)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
         Ok(dir.children.clone())
     }
 
@@ -79,7 +79,7 @@ impl State {
         let cache = self.cache.read().await;
         Ok(cache
             .get_node(node)
-            .ok_or_else(|| FsError::FileNotFound)?
+            .ok_or(FsError::FileNotFound)?
             .get_node_info())
     }
 
@@ -97,7 +97,7 @@ impl State {
         let mut cache = self.cache.write().await;
         let dir = cache
             .get_directory_mut(node)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
         if !dir.should_reload() {
             return Ok(cache);
         }
@@ -125,7 +125,7 @@ impl State {
             .read()
             .await
             .get_node(node)
-            .ok_or_else(|| FsError::FileNotFound)?
+            .ok_or(FsError::FileNotFound)?
             .get_file_attr()
             .await;
         Ok(node)
@@ -133,7 +133,7 @@ impl State {
 
     pub async fn open_file(&self, file: u64) -> Result<(), FsError> {
         let cache = self.cache.read().await;
-        let file = cache.get_file(file).ok_or_else(|| FsError::FileNotFound)?;
+        let file = cache.get_file(file).ok_or(FsError::FileNotFound)?;
         let should_read = {
             let fcache = file.cache_file.read().await;
             !file.is_new
@@ -149,7 +149,7 @@ impl State {
         let mut fcache = file.cache_file.write().await;
         // Need to check again after locking the write lock...
         if file.is_new
-            || !fcache.loaded_at.is_none() && fcache.exists()
+            || fcache.loaded_at.is_some() && fcache.exists()
             || !file.meta.uploaded
             || fcache.local_mod
         {
@@ -181,7 +181,7 @@ impl State {
 
     pub async fn read_to_buf(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, FsError> {
         let cache = self.cache.read().await;
-        let file = cache.get_file(ino).ok_or_else(|| FsError::FileNotFound)?;
+        let file = cache.get_file(ino).ok_or(FsError::FileNotFound)?;
         let fcache = file.cache_file.read().await;
         let mut handle = fcache.get_handle_read().await?;
 
@@ -196,7 +196,7 @@ impl State {
 
     pub async fn write_from_buf(&self, ino: u64, offset: i64, data: &[u8]) -> Result<(), FsError> {
         let cache = self.cache.read().await;
-        let file = cache.get_file(ino).ok_or_else(|| FsError::FileNotFound)?;
+        let file = cache.get_file(ino).ok_or(FsError::FileNotFound)?;
         let mut fcache = file.cache_file.write().await;
         let mut handle = fcache.get_handle_write(false, false).await?;
         handle.seek(SeekFrom::Start(offset as u64)).await?;
@@ -218,9 +218,7 @@ impl State {
         // First, we need to upload meta to CDF, which requires a write lock on the cache
         let (url, mime) = {
             let mut cache = gcache.write().await;
-            let old = cache
-                .get_file_mut(node)
-                .ok_or_else(|| FsError::FileNotFound)?;
+            let old = cache.get_file_mut(node).ok_or(FsError::FileNotFound)?;
             let oldid = old.meta.id;
             let new = client.files.upload(true, &AddFile::from(&old.meta)).await?;
             let newid = new.id;
@@ -259,7 +257,7 @@ impl State {
 
     pub async fn synchronize(&self, ino: u64, block: bool) -> Result<(), FsError> {
         let cache = self.cache.read().await;
-        let file = cache.get_file(ino).ok_or_else(|| FsError::FileNotFound)?;
+        let file = cache.get_file(ino).ok_or(FsError::FileNotFound)?;
         // First, try obtaining write access to the cache file, this will wait for ongoing synchronization...
         let mut fcache = file.cache_file.write().await;
         if !fcache.local_mod {
@@ -287,14 +285,13 @@ impl State {
 
     pub async fn close(&self, ino: u64) -> Result<(), FsError> {
         info!("Close file with ino {}", ino);
-        let r = self.synchronize(ino, false).await;
-        r
+        self.synchronize(ino, false).await
     }
 
     pub async fn set_size(&self, ino: u64, size: u64) -> Result<(), FsError> {
         info!("Truncate file with ino {} to {} bytes", ino, size);
         let cache = self.cache.read().await;
-        let file = cache.get_file(ino).ok_or_else(|| FsError::FileNotFound)?;
+        let file = cache.get_file(ino).ok_or(FsError::FileNotFound)?;
         let mut fcache = file.cache_file.write().await;
         fcache.set_size(size).await?;
         Ok(())
@@ -304,12 +301,12 @@ impl State {
         let mut cache = self.cache.write().await;
         let parent_dir = cache
             .get_directory(parent)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
         let existing = parent_dir
             .children
             .iter()
             .filter_map(|n| cache.get_node(*n))
-            .find(|n| n.name() == &name);
+            .find(|n| n.name() == name);
 
         if existing.is_some() {
             return Err(FsError::Conflict);
@@ -338,7 +335,7 @@ impl State {
 
         let parent = cache
             .get_directory_mut(parent)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
         parent.children.push(file);
 
         Ok(cache.get_file(file).unwrap().get_file_attr().await)
@@ -348,13 +345,13 @@ impl State {
         let mut cache = self.cache.write().await;
         let parent_dir = cache
             .get_directory(parent)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
 
         let existing = parent_dir
             .children
             .iter()
             .filter_map(|n| cache.get_node(*n))
-            .find(|n| n.name() == &name);
+            .find(|n| n.name() == name);
 
         if existing.is_some() {
             return Err(FsError::Conflict);
@@ -363,9 +360,7 @@ impl State {
         let path = PathBuf::from(parent_dir.path.clone()).join(name);
 
         let inode = cache.get_or_add_dir(
-            path.to_str()
-                .ok_or_else(|| FsError::InvalidPath)?
-                .to_string(),
+            path.to_str().ok_or(FsError::InvalidPath)?.to_string(),
             Some(parent),
         );
 
@@ -374,7 +369,7 @@ impl State {
 
         let parent = cache
             .get_directory_mut(parent)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
         parent.children.push(inode);
 
         Ok(cache.get_directory(inode).unwrap().get_file_attr())
@@ -384,47 +379,40 @@ impl State {
         let mut cache = self.cache.write().await;
         let parent_dir = cache
             .get_directory(parent)
-            .ok_or_else(|| FsError::DirectoryNotFound)?;
+            .ok_or(FsError::DirectoryNotFound)?;
 
         let existing = parent_dir
             .children
             .iter()
             .filter_map(|n| cache.get_node(*n))
-            .find(|n| n.name() == &name)
-            .ok_or_else(|| FsError::FileNotFound)?;
+            .find(|n| n.name() == name)
+            .ok_or(FsError::FileNotFound)?;
 
         let inode = existing.ino();
 
         // Do pre-checks...
-        match existing {
-            Node::Dir(d) => {
-                if !d.children.is_empty() {
-                    return Err(FsError::NotEmpty);
-                }
+        if let Node::Dir(d) = existing {
+            if !d.children.is_empty() {
+                return Err(FsError::NotEmpty);
             }
-            _ => (),
         }
 
         let removed = cache.remove_node(inode).unwrap();
         let inode = removed.ino();
 
         // Actually remove the file
-        match removed {
-            Node::File(f) => {
-                let mut fcache = f.cache_file.write().await;
-                if f.meta.id > 0 {
-                    self.client
-                        .files
-                        .delete(&[Identity::Id { id: f.meta.id }])
-                        .await?;
-                }
-
-                match fcache.delete_cache().await {
-                    Err(e) => warn!("Failed to delete cache file {:?}", e),
-                    _ => (),
-                }
+        if let Node::File(f) = removed {
+            let mut fcache = f.cache_file.write().await;
+            if f.meta.id > 0 {
+                self.client
+                    .files
+                    .delete(&[Identity::Id { id: f.meta.id }])
+                    .await?;
             }
-            _ => (),
+
+            if let Err(e) = fcache.delete_cache().await {
+                warn!("Failed to delete cache file {:?}", e)
+            }
         }
 
         let parent_dir = cache.get_directory_mut(parent).unwrap();

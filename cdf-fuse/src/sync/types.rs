@@ -171,12 +171,7 @@ impl SyncFile {
 
     #[allow(dead_code)]
     pub fn is_below_path(&self, path: &str) -> bool {
-        let sp = self
-            .meta
-            .directory
-            .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("/");
+        let sp = self.meta.directory.as_deref().unwrap_or("/");
         sp.starts_with(path)
     }
 

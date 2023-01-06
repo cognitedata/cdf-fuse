@@ -356,6 +356,7 @@ impl Filesystem for CdfFS {
         for ino in inos {
             run!(self, reply, self.cache.flush_file(&self.client, ino));
         } */
+        reply.ok();
     }
 }
 

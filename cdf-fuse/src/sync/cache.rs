@@ -109,14 +109,9 @@ impl SyncCache {
             }
         };
 
-        if let Some(n) = self.nodes.get_mut(&inode) {
-            match n {
-                Node::File(f) => {
-                    f.meta = file;
-                    return inode;
-                }
-                _ => (),
-            }
+        if let Some(Node::File(f)) = self.nodes.get_mut(&inode) {
+            f.meta = file;
+            return inode;
         }
 
         self.file_map.insert(file.id, inode);
@@ -144,13 +139,8 @@ impl SyncCache {
             }
         };
 
-        if let Some(n) = self.nodes.get_mut(&inode) {
-            match n {
-                Node::Dir(_) => {
-                    return inode;
-                }
-                _ => (),
-            }
+        if let Some(Node::Dir(_)) = self.nodes.get_mut(&inode) {
+            return inode;
         }
 
         self.dir_map.insert(dir.clone(), inode);
@@ -191,9 +181,7 @@ impl SyncCache {
             for p in ps.into_iter() {
                 let parent = if p == "/" { None } else { Some(last_dir) };
                 let dir = self.get_or_add_dir(p.clone(), parent);
-                if !built_dirs.contains_key(&dir) {
-                    built_dirs.insert(dir, HashSet::new());
-                }
+                built_dirs.entry(dir).or_insert_with(HashSet::new);
                 built_dirs.get_mut(&last_dir).unwrap().insert(dir);
                 last_dir = dir;
             }
@@ -214,7 +202,7 @@ impl SyncCache {
 
             let mut new_children = vec![];
             for entry in entries.iter() {
-                if !node_set.contains(&entry) {
+                if !node_set.contains(entry) {
                     new_children.push(*entry);
                 }
                 known_nodes.insert(*entry);
