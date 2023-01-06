@@ -3,7 +3,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FsError {
-    #[error("Cognite Error")]
+    #[error("Cognite Error {0}")]
     Cognite(#[from] cognite::Error),
     #[error("Directory not found")]
     DirectoryNotFound,
@@ -15,6 +15,8 @@ pub enum FsError {
     InvalidPath,
     #[error("Directory not empty")]
     NotEmpty,
+    #[error("Node with name already exists")]
+    Conflict,
 }
 
 impl FsError {

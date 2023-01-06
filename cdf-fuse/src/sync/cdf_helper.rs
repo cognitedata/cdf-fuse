@@ -8,8 +8,6 @@ use log::info;
 
 use crate::err::FsError;
 
-use super::types::SyncFile;
-
 pub async fn load_cached_directory(
     client: &CogniteClient,
     expected_size: usize,

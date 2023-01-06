@@ -1,14 +1,21 @@
-use std::{collections::HashMap, io::SeekFrom, sync::Arc, time::Instant};
+use std::{
+    io::SeekFrom,
+    path::PathBuf,
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
-use cognite::{files::AddFile, CogniteClient, Identity};
+use cognite::{
+    files::{AddFile, FileMetadata},
+    CogniteClient, Delete, Identity,
+};
 use fuser::FileAttr;
 use futures_util::{SinkExt, TryStreamExt};
-use log::info;
+use log::{info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{RwLock, RwLockWriteGuard},
-    task::JoinHandle,
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
@@ -17,7 +24,7 @@ use crate::err::FsError;
 use super::{
     cache::SyncCache,
     cdf_helper::load_cached_directory,
-    types::{CacheFileAccess, NodeInfo},
+    types::{CacheFileAccess, Node, NodeInfo},
 };
 
 pub struct State {
@@ -67,6 +74,7 @@ impl State {
         cache.get_nodes(nodes).map(|n| n.get_node_info()).collect()
     }
 
+    #[allow(dead_code)]
     pub async fn get_node_info(&self, node: u64) -> Result<NodeInfo, FsError> {
         let cache = self.cache.read().await;
         Ok(cache
@@ -75,6 +83,7 @@ impl State {
             .get_node_info())
     }
 
+    #[allow(dead_code)]
     pub async fn get_file_attrs(&self, nodes: &[u64]) -> Vec<FileAttr> {
         let mut res = vec![];
         let cache = self.cache.read().await;
@@ -273,14 +282,138 @@ impl State {
     }
 
     pub async fn close(&self, ino: u64) -> Result<(), FsError> {
-        self.synchronize(ino, false).await
+        info!("Close file with ino {}", ino);
+        let r = self.synchronize(ino, false).await;
+        r
     }
 
     pub async fn set_size(&self, ino: u64, size: u64) -> Result<(), FsError> {
+        info!("Truncate file with ino {} to {} bytes", ino, size);
         let cache = self.cache.read().await;
         let file = cache.get_file(ino).ok_or_else(|| FsError::FileNotFound)?;
         let mut fcache = file.cache_file.write().await;
         fcache.set_size(size).await?;
+        Ok(())
+    }
+
+    pub async fn add_file(&self, name: String, parent: u64) -> Result<FileAttr, FsError> {
+        let mut cache = self.cache.write().await;
+        let parent_dir = cache
+            .get_directory(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?;
+        let existing = parent_dir
+            .children
+            .iter()
+            .filter_map(|n| cache.get_node(*n))
+            .find(|n| n.name() == &name);
+
+        if existing.is_some() {
+            return Err(FsError::Conflict);
+        }
+
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let meta = FileMetadata {
+            name: name.clone(),
+            directory: parent_dir.get_cdf_directory(),
+            mime_type: Some(
+                mime_guess::from_path(name)
+                    .first()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "application/binary".to_string()),
+            ),
+            source_created_time: Some(time),
+            source_modified_time: Some(time),
+            id: 0,
+            uploaded: false,
+            ..Default::default()
+        };
+        let file = cache.add_file(meta, parent);
+
+        let parent = cache
+            .get_directory_mut(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?;
+        parent.children.push(file);
+
+        Ok(cache.get_file(file).unwrap().get_file_attr().await)
+    }
+
+    pub async fn add_dir(&self, name: String, parent: u64) -> Result<FileAttr, FsError> {
+        let mut cache = self.cache.write().await;
+        let parent_dir = cache
+            .get_directory(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?;
+
+        let existing = parent_dir
+            .children
+            .iter()
+            .filter_map(|n| cache.get_node(*n))
+            .find(|n| n.name() == &name);
+
+        if existing.is_some() {
+            return Err(FsError::Conflict);
+        }
+
+        let path = PathBuf::from(parent_dir.path.clone()).join(name);
+
+        let inode = cache.get_or_add_dir(
+            path.to_str()
+                .ok_or_else(|| FsError::InvalidPath)?
+                .to_string(),
+            Some(parent),
+        );
+
+        Ok(cache.get_directory(inode).unwrap().get_file_attr())
+    }
+
+    pub async fn delete_node_from_parent(&self, name: String, parent: u64) -> Result<(), FsError> {
+        let mut cache = self.cache.write().await;
+        let parent_dir = cache
+            .get_directory(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?;
+
+        let existing = parent_dir
+            .children
+            .iter()
+            .filter_map(|n| cache.get_node(*n))
+            .find(|n| n.name() == &name)
+            .ok_or_else(|| FsError::FileNotFound)?;
+
+        let inode = existing.ino();
+
+        // Do pre-checks...
+        match existing {
+            Node::Dir(d) => {
+                if !d.children.is_empty() {
+                    return Err(FsError::NotEmpty);
+                }
+            }
+            _ => (),
+        }
+
+        let removed = cache.remove_node(inode).unwrap();
+
+        // Actually remove the file
+        match removed {
+            Node::File(f) => {
+                let mut fcache = f.cache_file.write().await;
+                if f.meta.id > 0 {
+                    self.client
+                        .files
+                        .delete(&[Identity::Id { id: f.meta.id }])
+                        .await?;
+                }
+
+                match fcache.delete_cache().await {
+                    Err(e) => warn!("Failed to delete cache file {:?}", e),
+                    _ => (),
+                }
+            }
+            _ => (),
+        }
+
         Ok(())
     }
 }

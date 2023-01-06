@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -12,10 +11,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{
-    err::FsError,
-    types::{CachedDirectory, BLOCK_SIZE},
-};
+pub const BLOCK_SIZE: u64 = 512;
 
 pub struct CacheFileAccess {
     pub cache_path: PathBuf,
@@ -65,6 +61,14 @@ impl CacheFileAccess {
         let fh = self.get_handle_write(false, false).await?;
         fh.set_len(size).await?;
         Ok(())
+    }
+
+    pub async fn delete_cache(&mut self) -> Result<(), std::io::Error> {
+        if Path::exists(&self.cache_path) {
+            tokio::fs::remove_file(&self.cache_path).await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -118,6 +122,14 @@ impl SyncDirectory {
             parent: self.parent,
         }
     }
+
+    pub fn get_cdf_directory(&self) -> Option<String> {
+        if self.path == "/" {
+            None
+        } else {
+            Some(self.path.clone())
+        }
+    }
 }
 
 pub struct SyncFile {
@@ -157,6 +169,7 @@ impl SyncFile {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_below_path(&self, path: &str) -> bool {
         let sp = self
             .meta
@@ -206,6 +219,13 @@ impl Node {
         match self {
             Self::Dir(d) => &d.name,
             Self::File(f) => &f.meta.name,
+        }
+    }
+
+    pub fn ino(&self) -> u64 {
+        match self {
+            Self::Dir(d) => d.inode,
+            Self::File(f) => f.inode,
         }
     }
 

@@ -83,7 +83,24 @@ impl SyncCache {
         nodes.iter().filter_map(|f| self.get_node(*f))
     }
 
-    pub fn add_file(&mut self, file: FileMetadata, parent: u64) -> u64 {
+    pub fn remove_node(&mut self, node: u64) -> Option<Node> {
+        let n = self.nodes.remove(&node);
+        match &n {
+            Some(Node::File(f)) => {
+                self.file_map.remove(&f.meta.id);
+            }
+            Some(Node::Dir(d)) => {
+                self.dir_map.remove(&d.path);
+            }
+            None => (),
+        }
+        n
+    }
+
+    pub fn add_file(&mut self, mut file: FileMetadata, parent: u64) -> u64 {
+        if file.id == 0 {
+            file.id = -(self.inode_counter as i64 + 1);
+        }
         let inode = match self.file_map.get(&file.id) {
             Some(x) => *x,
             None => {

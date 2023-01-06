@@ -2,11 +2,9 @@ use clap::{Arg, ArgAction, Command};
 use fs::CdfFS;
 use fuser::MountOption;
 
-mod cache;
 mod err;
 mod fs;
 mod sync;
-mod types;
 
 fn main() {
     env_logger::init();
