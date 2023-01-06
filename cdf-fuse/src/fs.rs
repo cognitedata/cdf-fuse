@@ -150,7 +150,7 @@ impl Filesystem for CdfFS {
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        debug!("open() called for inode {}", ino);
+        info!("Open file with ino {}", ino);
         run!(self, reply, self.state.open_file(ino));
         reply.opened(self.get_next_fh(), 0);
     }
@@ -181,7 +181,6 @@ impl Filesystem for CdfFS {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        info!("Closing file with ino {}", ino);
         run!(self, reply, self.state.close(ino));
         reply.ok()
     }
@@ -205,8 +204,6 @@ impl Filesystem for CdfFS {
         reply: fuser::ReplyAttr,
     ) {
         if let Some(size) = size {
-            debug!("truncate() called with {:?} {:?}", ino, size);
-
             run!(self, reply, self.state.set_size(ino, size));
         }
 
@@ -282,6 +279,7 @@ impl Filesystem for CdfFS {
         _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
+        info!("Try add directory {:?} to parent {}", name.to_str(), parent);
         let name = name.to_str().unwrap().to_string();
 
         let attr = run!(self, reply, self.state.add_dir(name, parent));
@@ -324,7 +322,6 @@ impl Filesystem for CdfFS {
 
         reply.ok();
     }
-    /*
     fn fsync(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -334,7 +331,7 @@ impl Filesystem for CdfFS {
         reply: fuser::ReplyEmpty,
     ) {
         info!("Fsync called for node {}", ino);
-        run!(self, reply, self.cache.flush_file(&self.client, ino));
+        // run!(self, reply, self.cache.flush_file(&self.client, ino));
         reply.ok();
     }
 
@@ -347,7 +344,7 @@ impl Filesystem for CdfFS {
         reply: fuser::ReplyEmpty,
     ) {
         info!("Fsyncdir called for node {}", ino);
-        let dir = match self.cache.get_dir(ino) {
+        /* let dir = match self.cache.get_dir(ino) {
             Some(x) => x,
             None => fail!(libc::ENOENT, reply),
         };
@@ -358,8 +355,8 @@ impl Filesystem for CdfFS {
 
         for ino in inos {
             run!(self, reply, self.cache.flush_file(&self.client, ino));
-        }
-    } */
+        } */
+    }
 }
 
 struct EntryDesc {

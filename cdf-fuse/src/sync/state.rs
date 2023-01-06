@@ -96,7 +96,7 @@ impl State {
     async fn reload_directory(&self, node: u64) -> Result<RwLockWriteGuard<SyncCache>, FsError> {
         let mut cache = self.cache.write().await;
         let dir = cache
-            .get_directory(node)
+            .get_directory_mut(node)
             .ok_or_else(|| FsError::DirectoryNotFound)?;
         if !dir.should_reload() {
             return Ok(cache);
@@ -107,6 +107,9 @@ impl State {
         } else {
             100_000
         };
+        // Set loaded at here, even if there are no results from CDF, it is still going to
+        // be loaded
+        dir.loaded_at = Some(Instant::now());
 
         let root = dir.path.clone();
         let files = load_cached_directory(&self.client, expected_size, root.clone()).await?;
@@ -249,6 +252,7 @@ impl State {
                 .upload_stream_known_size(&mime, &url, stream, size)
                 .await?;
         }
+        info!("Uploaded file with ino {} to CDF", node);
 
         Ok(())
     }
@@ -365,6 +369,14 @@ impl State {
             Some(parent),
         );
 
+        let node = cache.get_directory_mut(inode).unwrap();
+        node.loaded_at = Some(Instant::now());
+
+        let parent = cache
+            .get_directory_mut(parent)
+            .ok_or_else(|| FsError::DirectoryNotFound)?;
+        parent.children.push(inode);
+
         Ok(cache.get_directory(inode).unwrap().get_file_attr())
     }
 
@@ -394,6 +406,7 @@ impl State {
         }
 
         let removed = cache.remove_node(inode).unwrap();
+        let inode = removed.ino();
 
         // Actually remove the file
         match removed {
@@ -413,6 +426,9 @@ impl State {
             }
             _ => (),
         }
+
+        let parent_dir = cache.get_directory_mut(parent).unwrap();
+        parent_dir.children.retain(|i| i != &inode);
 
         Ok(())
     }
