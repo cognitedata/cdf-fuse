@@ -11,7 +11,7 @@ use cognite::{
     CogniteClient, Delete, Identity,
 };
 use fuser::FileAttr;
-use futures_util::{SinkExt, TryStreamExt};
+use futures_util::{future::join_all, SinkExt, TryStreamExt};
 use log::{info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -85,12 +85,9 @@ impl State {
 
     #[allow(dead_code)]
     pub async fn get_file_attrs(&self, nodes: &[u64]) -> Vec<FileAttr> {
-        let mut res = vec![];
         let cache = self.cache.read().await;
-        for node in cache.get_nodes(nodes) {
-            res.push(node.get_file_attr().await);
-        }
-        res
+        let futures = cache.get_nodes(nodes).map(|n| n.get_file_attr());
+        join_all(futures).await
     }
 
     async fn reload_directory(&self, node: u64) -> Result<RwLockWriteGuard<SyncCache>, FsError> {

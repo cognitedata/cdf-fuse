@@ -134,7 +134,9 @@ impl Filesystem for CdfFS {
         let iter = Self::to_dir_desc(ino, self_info.parent, nodes);
         let iter = iter.skip(offset as usize);
 
+        let mut count = 0;
         for entry in iter {
+            count += 1;
             debug!(
                 "Add entry {} to buffer with offset {}",
                 entry.name, entry.offset
@@ -145,6 +147,8 @@ impl Filesystem for CdfFS {
                 break;
             }
         }
+
+        info!("Load {} entries for dir with ino {}", count, ino);
 
         reply.ok();
     }
