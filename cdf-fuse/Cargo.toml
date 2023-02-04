@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 fuser = "0.11.1"
 cognite = { git = "https://github.com/cognitedata/cognite-sdk-rust", rev = "3c1b2cbd83097193890b42f06904086d9b6343cb" }
-tokio = { version = "1.23.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
 tokio-util = "0.7.4"
 libc = "0.2.138"
 serde = { version = "1.0.149", features = ["derive"] }
