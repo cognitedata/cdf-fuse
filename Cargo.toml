@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "cdf-fuse"
+]
+resolver = "2"

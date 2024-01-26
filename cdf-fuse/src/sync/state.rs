@@ -24,19 +24,21 @@ use crate::err::FsError;
 use super::{
     cache::SyncCache,
     cdf_helper::load_cached_directory,
-    types::{CacheFileAccess, Node, NodeInfo},
+    types::{CacheFileAccess, Node, NodeInfo, SyncDirectory},
 };
 
 pub struct State {
     pub cache: Arc<RwLock<SyncCache>>,
     pub client: Arc<CogniteClient>,
+    inst_name: String,
 }
 
 impl State {
-    pub fn new(client: CogniteClient, cache_dir: String) -> Self {
+    pub fn new(client: CogniteClient, cache_dir: String, inst_name: String) -> Self {
         Self {
             cache: Arc::new(RwLock::new(SyncCache::new(cache_dir))),
             client: Arc::new(client),
+            inst_name,
         }
     }
 
@@ -294,6 +296,15 @@ impl State {
         Ok(())
     }
 
+    fn get_ext_id(&self, parent: &SyncDirectory, name: &str) -> String {
+        format!(
+            "{}_{}{}",
+            self.inst_name,
+            parent.get_cdf_directory().unwrap_or_default(),
+            name
+        )
+    }
+
     pub async fn add_file(&self, name: String, parent: u64) -> Result<FileAttr, FsError> {
         let mut cache = self.cache.write().await;
         let parent_dir = cache
@@ -316,6 +327,7 @@ impl State {
         let meta = FileMetadata {
             name: name.clone(),
             directory: parent_dir.get_cdf_directory(),
+            external_id: Some(self.get_ext_id(&parent_dir, &name)),
             mime_type: Some(
                 mime_guess::from_path(name)
                     .first()
