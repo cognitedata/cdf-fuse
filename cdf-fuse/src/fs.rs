@@ -423,7 +423,7 @@ impl CdfFS {
             .to_string();
         CdfFS {
             rt,
-            state: State::new(client, temp_dir.clone()),
+            state: State::new(client, temp_dir.clone(), config.name.clone()),
             config,
             temp_dir,
             fh_counter: AtomicU64::new(0),
